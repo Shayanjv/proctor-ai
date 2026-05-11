@@ -1,7 +1,9 @@
 from sqlalchemy.orm import Session
 from models.questions import Question
 from models.sessions import ExamSession
+from models.logs import Log
 from schemas.exam import ExamSubmission, ExamResult
+from services.mark_penalty_service import MarkPenaltyService
 from utils.logger import logger
 from datetime import datetime
 import re
@@ -162,7 +164,23 @@ class GradingService:
             session.saved_answers = user_answers_map
             session.status = "completed"
             session.end_time = datetime.utcnow()
-            
+
+            # 6. Compute the proctor mark-penalty recommendation. The admin
+            #    still picks the final_score later via the score-decision
+            #    endpoint, so we deliberately leave `final_score` /
+            #    `score_decision` NULL ("pending review").
+            try:
+                GradingService._recompute_proctor_decision(
+                    db=db,
+                    session=session,
+                    raw_score=total_score,
+                    total_marks=float(max_marks or 0.0),
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"Penalty recompute failed for session {session.id}: {exc}"
+                )
+
             db.commit()
 
             return ExamResult(
@@ -173,11 +191,57 @@ class GradingService:
                 score=total_score,
                 total_marks=max_marks,
                 percentage=round(percentage, 2),
-                status="passed" if percentage >= 40 else "failed"
+                status="passed" if percentage >= 40 else "failed",
+                final_score=None,
             )
 
         except Exception as e:
             logger.error(f"Grading error for user {user_id}: {str(e)}")
             db.rollback()
             raise e
+
+    # ──────────────────────────────────────────────────────────────────
+    # Proctor mark-penalty recompute helper.
+    #
+    # Counts MAJOR + CRITICAL violation logs for the session and writes the
+    # AI-recommended deduction columns onto the session. Called both from
+    # grade_exam (post-grade) and from get_exam_summary (so older sessions
+    # without these fields self-heal on first view — "compute on demand").
+    # ──────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _recompute_proctor_decision(
+        *,
+        db: Session,
+        session: ExamSession,
+        raw_score: float,
+        total_marks: float,
+    ) -> None:
+        """Populate `major_violation_count`, `critical_violation_count`,
+        `proctor_penalty_pct`, `proctor_adjusted_score` on `session`.
+
+        Does NOT touch `final_score` / `score_decision` — those stay under
+        admin control. Caller is responsible for committing.
+        """
+        # Pull all logs for this user that fell within this session's time
+        # window. session_id is not currently set on Log rows, so we
+        # bracket by [start_time, end_time] to scope to *this attempt*.
+        end_ts = getattr(session, "end_time", None) or datetime.utcnow()
+        start_ts = getattr(session, "start_time", None)
+        log_query = db.query(Log).filter(Log.user_id == session.user_id)
+        if start_ts is not None:
+            log_query = log_query.filter(Log.timestamp >= start_ts)
+        log_query = log_query.filter(Log.timestamp <= end_ts)
+
+        result = MarkPenaltyService.compute_from_logs(
+            log_query.all(),
+            raw_score=raw_score,
+            total_marks=total_marks,
+        )
+
+        session.major_violation_count = result.major_count
+        session.critical_violation_count = result.critical_count
+        session.proctor_penalty_pct = result.penalty_pct
+        session.proctor_adjusted_score = result.adjusted_score
+        session.overall_compliance = max(0.0, 100.0 - result.penalty_pct)
 

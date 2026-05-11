@@ -1,0 +1,219 @@
+# =============================================================================
+# Production stack for a single-host deployment (e.g. DigitalOcean Droplet).
+# -----------------------------------------------------------------------------
+# Reachable via a single public IP, routed through Caddy on :80 / :443 to:
+#
+#   https://${PUBLIC_HOST}            -> student frontend  (default)
+#   https://admin.${PUBLIC_HOST}      -> admin frontend
+#   https://api.${PUBLIC_HOST}        -> FastAPI backend (REST + /ws WebSocket)
+#
+# `${PUBLIC_HOST}` is typically a free `nip.io` style hostname derived from the
+# Droplet's public IP - e.g. `167-99-45-12.nip.io` - so no domain registrar is
+# needed. Caddy obtains real Let's Encrypt certificates for all three names
+# automatically (HTTP-01 challenge on :80).
+#
+# IMPORTANT: only ports 80 and 443 are exposed to the public internet.
+# Postgres, Redis, MinIO, Adminer stay on the internal `proctor_net` bridge.
+# Adminer is INTENTIONALLY not published; if you need it temporarily, run
+# `docker-compose -f docker-compose.prod.yml up -d adminer` and use SSH
+# tunnelling (`ssh -L 8081:proctoring-adminer:8080 root@droplet`).
+#
+# Run:
+#   docker-compose -f docker-compose.prod.yml --env-file .env up -d --build
+# =============================================================================
+version: '3.8'
+
+networks:
+  proctor_net:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
+  logs_data:
+  caddy_data:    # persisted Let's Encrypt certs & ACME account keys
+  caddy_config:
+
+services:
+  # ---------------------------------------------------------------------------
+  # 1. PostgreSQL
+  # ---------------------------------------------------------------------------
+  db:
+    image: postgres:15-alpine
+    container_name: proctoring-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks: [proctor_net]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 2. Redis
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    container_name: proctoring-redis
+    restart: unless-stopped
+    networks: [proctor_net]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 3. MinIO (S3-compatible object storage for evidence frames)
+  # ---------------------------------------------------------------------------
+  minio:
+    image: minio/minio
+    container_name: proctoring-storage
+    restart: unless-stopped
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks: [proctor_net]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+  # ---------------------------------------------------------------------------
+  # 4. FastAPI backend
+  # ---------------------------------------------------------------------------
+  backend:
+    build:
+      context: ./Proctoring-AI-BE-M4/Proctoring-AI-BE-M4
+      dockerfile: Dockerfile
+    container_name: proctoring-backend
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_started
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      DB_TYPE: postgres
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      DATABASE_HOST: db
+      DB_HOST: db
+      DATABASE_PORT: 5432
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      # CORS must allow both frontend subdomains. The backend code only
+      # honours an exact-match list, so we list both explicitly.
+      CORS_ORIGINS: https://${PUBLIC_HOST},https://admin.${PUBLIC_HOST}
+      STUDENT_FRONTEND_URL: https://${PUBLIC_HOST}
+      ADMIN_FRONTEND_URL: https://admin.${PUBLIC_HOST}
+      WS_BASE_URL: wss://api.${PUBLIC_HOST}/ws
+      SEED_DEFAULT_USERS: ${SEED_DEFAULT_USERS:-true}
+      SEED_ADMIN_EMAIL: ${SEED_ADMIN_EMAIL}
+      SEED_ADMIN_PASSWORD: ${SEED_ADMIN_PASSWORD}
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      GUNICORN_TIMEOUT: ${GUNICORN_TIMEOUT:-0}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
+      MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET_NAME: ${MINIO_BUCKET_NAME}
+      MINIO_SECURE: "false"
+    # Use the Dockerfile's CMD (single worker, no preload, no timeout - tuned
+    # for the ML stack). Do NOT override here unless you know what you're doing.
+    volumes:
+      - logs_data:/app/logs
+    networks: [proctor_net]
+    mem_limit: 3g
+
+  # ---------------------------------------------------------------------------
+  # 5. Admin frontend (Vite + nginx)
+  # ---------------------------------------------------------------------------
+  admin-frontend:
+    build:
+      context: ./Proctoring-AI-Admin
+      dockerfile: Dockerfile
+      args:
+        # These are baked into the static bundle at build time. If you change
+        # PUBLIC_HOST, you MUST rebuild this image: `docker-compose build admin-frontend`.
+        VITE_API_URL: https://api.${PUBLIC_HOST}/api/v1/
+        VITE_WS_URL: wss://api.${PUBLIC_HOST}/ws
+    container_name: proctoring-admin-fe
+    restart: unless-stopped
+    networks: [proctor_net]
+    depends_on:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # 6. Student frontend (Vite + nginx)
+  # ---------------------------------------------------------------------------
+  student-frontend:
+    build:
+      context: ./Proctoring-AI-FE-M4/Proctoring-AI-FE-M4
+      dockerfile: Dockerfile
+      args:
+        # Student code paths append `/api/v1/...` themselves, so this is the
+        # ORIGIN only - no trailing path.
+        VITE_API_URL: https://api.${PUBLIC_HOST}
+        VITE_WS_URL: wss://api.${PUBLIC_HOST}/ws
+        VITE_ADMIN_URL: https://admin.${PUBLIC_HOST}
+    container_name: proctoring-student-fe
+    restart: unless-stopped
+    networks: [proctor_net]
+    depends_on:
+      - backend
+
+  # ---------------------------------------------------------------------------
+  # 7. Caddy reverse proxy - terminates TLS and routes the 3 hostnames
+  # ---------------------------------------------------------------------------
+  caddy:
+    image: caddy:2.8-alpine
+    container_name: proctoring-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      PUBLIC_HOST: ${PUBLIC_HOST}
+      LETSENCRYPT_EMAIL: ${LETSENCRYPT_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks: [proctor_net]
+    depends_on:
+      - backend
+      - admin-frontend
+      - student-frontend
+
+  # ---------------------------------------------------------------------------
+  # 8. Adminer - DB viewer. Not exposed to the internet on purpose.
+  #     Reach via SSH tunnel: `ssh -L 8081:localhost:8081 root@<droplet>`
+  #     then http://localhost:8081 with server=db.
+  # ---------------------------------------------------------------------------
+  adminer:
+    image: adminer
+    container_name: proctoring-adminer
+    restart: unless-stopped
+    environment:
+      ADMINER_DEFAULT_SERVER: db
+    # Only bound to the loopback of the host so SSH tunnel works but the
+    # public internet cannot reach it.
+    ports:
+      - "127.0.0.1:8081:8080"
+    networks: [proctor_net]
+    depends_on:
+      - db

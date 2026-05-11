@@ -5,7 +5,6 @@ import {
   ExternalLink,
   Camera,
   Mic,
-  FileDown,
   ChevronRight,
   Check,
   AlertCircle,
@@ -27,6 +26,7 @@ import {
   hasCompletedSystemChecks,
   updateLobbyProgress,
 } from "../utils/lobbyProgress";
+import { isInsideSEB, buildSebLaunchUrl, SEB_DOWNLOAD_URL } from "../utils/seb";
 
 export function SystemCheckPage() {
   const navigate = useNavigate();
@@ -38,7 +38,9 @@ export function SystemCheckPage() {
   const [microphoneError, setMicrophoneError] = useState("");
   const [cameraDeviceLabel, setCameraDeviceLabel] = useState("");
   const [microphoneDeviceLabel, setMicrophoneDeviceLabel] = useState("");
-  const [configDownloaded, setConfigDownloaded] = useState(false);
+  const [installLinkOpened, setInstallLinkOpened] = useState(false);
+  const [sebLaunchPending, setSebLaunchPending] = useState(false);
+  const [sebLaunchError, setSebLaunchError] = useState("");
   const { examId: routeExamId } = useParams();
   const examId = routeExamId || localStorage.getItem("examId") || "";
 
@@ -63,9 +65,9 @@ export function SystemCheckPage() {
     const storedProgress = getLobbyProgress(examId);
     setBrowserDownloaded(Boolean(storedProgress.systemChecks?.browserDownloaded));
     setBrowserOpened(Boolean(storedProgress.systemChecks?.browserOpened));
+    setInstallLinkOpened(Boolean(storedProgress.systemChecks?.installLinkOpened));
     setCameraAllowed(Boolean(storedProgress.systemChecks?.cameraAllowed));
     setMicrophoneAllowed(Boolean(storedProgress.systemChecks?.microphoneAllowed));
-    setConfigDownloaded(Boolean(storedProgress.systemChecks?.configDownloaded));
 
     const fetchData = async (attempt = 0) => {
       setLoading(true);
@@ -150,39 +152,100 @@ export function SystemCheckPage() {
       systemChecks: {
         browserDownloaded,
         browserOpened,
+        installLinkOpened,
         cameraAllowed,
         microphoneAllowed,
-        configDownloaded,
       },
     });
   }, [
     browserDownloaded,
     browserOpened,
+    installLinkOpened,
     cameraAllowed,
     microphoneAllowed,
-    configDownloaded,
     examId,
   ]);
 
-  // Auto-detect SEB
+  // Real SEB runtime detection: if the page is loaded inside Safe Exam
+  // Browser, both browser steps are immediately satisfied. Detection runs
+  // on mount AND on focus (covers the case where the student switches back
+  // to this tab after SEB has launched in another window — though in the
+  // common path, SEB is the only window and this detection runs once).
   useEffect(() => {
-    const isSEB = navigator.userAgent.includes('SEB');
-    if (isSEB || localStorage.getItem('dev_bypass_seb') === 'true') {
-      setBrowserDownloaded(true);
-      setBrowserOpened(true);
-    }
+    const detect = () => {
+      if (isInsideSEB()) {
+        setBrowserDownloaded(true);
+        setBrowserOpened(true);
+        setInstallLinkOpened(true);
+        setSebLaunchPending(false);
+      }
+    };
+    detect();
+    window.addEventListener("focus", detect);
+    return () => window.removeEventListener("focus", detect);
   }, []);
 
   const handleDownloadBrowser = () => {
-    // In a real app, this links to the SEB download page
-    window.open("https://safeexambrowser.org/download_en.html", "_blank");
+    // Open the official SEB download page. Do NOT auto-mark step 1 as
+    // complete here — completion now requires the explicit confirmation
+    // chip below (or detection that the page is already inside SEB).
+    window.open(SEB_DOWNLOAD_URL, "_blank", "noopener,noreferrer");
+    setInstallLinkOpened(true);
+  };
+
+  const handleConfirmInstalled = () => {
     setBrowserDownloaded(true);
   };
 
-  const handleOpenBrowser = () => {
-    // Simulate opening browser or allow manual dev bypass without breaking automated test runners
-    localStorage.setItem('dev_bypass_seb', 'true');
+  const handleOpenBrowser = async () => {
+    setSebLaunchError("");
+    setSebLaunchPending(true);
+
+    // Mint a single-use auto-login token while the student is still
+    // authenticated in the REGULAR browser. We bake it into the seb://
+    // URL so the FE running inside SEB can redeem it for a JWT — the
+    // student never sees a login form in the locked-down browser.
+    //
+    // If the token call fails (network down, JWT expired, etc.) we still
+    // launch SEB but without a token; the student will fall back to the
+    // regular login screen inside SEB. We surface a soft warning rather
+    // than blocking the launch entirely.
+    let sebToken: string | null = null;
+    try {
+      const result = await authService.requestSebToken(examId);
+      sebToken = (result?.token as string | undefined) ?? null;
+    } catch (err) {
+      console.warn(
+        "[SEB] Could not mint auto-login token; SEB will require re-login:",
+        err
+      );
+    }
+
+    const sebUrl = buildSebLaunchUrl(examId, sebToken);
+    if (!sebUrl) {
+      setSebLaunchPending(false);
+      setSebLaunchError(
+        "Cannot launch Safe Exam Browser: VITE_API_URL is not configured. Contact the proctor."
+      );
+      return;
+    }
+
+    // Hand control to the OS, which routes the seb:// URL to Safe Exam
+    // Browser. SEB then fetches the .seb config from the backend and opens
+    // the lobby page in lockdown mode. This regular-browser tab becomes
+    // irrelevant — the student continues inside SEB.
+    window.location.href = sebUrl;
+  };
+
+  const handleDevSkipSeb = () => {
+    // Visible only when import.meta.env.DEV is true. Lets a developer
+    // bypass the SEB requirement on a machine that doesn't have SEB
+    // installed, so the rest of the lobby (camera/mic/network) can be
+    // exercised. Production builds never render the trigger for this.
+    setBrowserDownloaded(true);
     setBrowserOpened(true);
+    setInstallLinkOpened(true);
+    setSebLaunchPending(false);
   };
 
   const handleRequestCamera = async () => {
@@ -272,30 +335,6 @@ export function SystemCheckPage() {
     }
   };
 
-  const handleDownloadConfig = () => {
-    const configData = {
-      examId: examId || "CURRENT-EXAM",
-      browserVersion: "SafeBrowser v3.2.1",
-      timestamp: new Date().toISOString(),
-      settings: {
-        lockdown: true,
-        monitoring: true,
-        allowedApps: [],
-      },
-    };
-
-    const blob = new Blob([JSON.stringify(configData, null, 2)], {
-      type: "application/json",
-    });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.download = "exam-config.json";
-    link.click();
-    URL.revokeObjectURL(url);
-    setConfigDownloaded(true);
-  };
-
   const canProceed = hasCompletedSystemChecks({
     systemChecks: {
       browserDownloaded,
@@ -377,23 +416,39 @@ export function SystemCheckPage() {
           <CheckCard
             icon={Download}
             title="Download Safe Browser"
-            description="Download the secure exam browser to your device"
+            description="Install Safe Exam Browser, then confirm below"
             checked={browserDownloaded}
             stepNumber={1}
             action={
               <ActionButton
                 onClick={handleDownloadBrowser}
                 completed={browserDownloaded}
-                label="Download"
-                completedLabel="Downloaded"
+                label={installLinkOpened ? "Re-open download" : "Download"}
+                completedLabel="Installed"
               />
             }
-          />
+          >
+            {installLinkOpened && !browserDownloaded && (
+              <div className="ml-15 mt-1 flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={handleConfirmInstalled}
+                  className="inline-flex items-center gap-1.5 rounded-full border border-emerald-300 bg-emerald-50 px-3 py-1.5 text-[12px] text-emerald-700 transition hover:bg-emerald-100"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  I have installed Safe Exam Browser
+                </button>
+                <span className="text-[12px] text-gray-500">
+                  Click only after the SEB installer finishes on your device.
+                </span>
+              </div>
+            )}
+          </CheckCard>
 
           <CheckCard
             icon={ExternalLink}
             title="Open in Safe Browser"
-            description="Launch the exam in the safe browser environment"
+            description="Hand this exam off to Safe Exam Browser in lockdown mode"
             checked={browserOpened}
             disabled={!browserDownloaded}
             stepNumber={2}
@@ -402,12 +457,34 @@ export function SystemCheckPage() {
                 onClick={handleOpenBrowser}
                 disabled={!browserDownloaded}
                 completed={browserOpened}
-                label="Open Browser"
+                label={sebLaunchPending ? "Launching…" : "Open in SEB"}
                 completedLabel="Opened"
               />
             }
-          />
+          >
+            {sebLaunchPending && !browserOpened && (
+              <div className="ml-15 mt-1 flex items-start gap-2 rounded-lg border border-blue-100 bg-blue-50/80 p-3">
+                <Info className="mt-0.5 h-4 w-4 flex-shrink-0 text-blue-500" />
+                <p className="text-[12px] text-blue-800">
+                  Safe Exam Browser is launching. If a system prompt appears, choose <strong>Open Safe Exam Browser</strong>. Continue this lobby inside the SEB window — you can close this tab.
+                </p>
+              </div>
+            )}
+            {sebLaunchError && <ErrorMessage message={sebLaunchError} />}
+          </CheckCard>
         </div>
+        {import.meta.env.DEV && !browserOpened && (
+          <div className="mt-3 ml-1 text-[11px] text-gray-400">
+            <button
+              type="button"
+              onClick={handleDevSkipSeb}
+              className="underline hover:text-gray-600"
+            >
+              Skip SEB (dev only)
+            </button>
+            <span className="ml-2">— hidden in production builds</span>
+          </div>
+        )}
       </div>
 
       {/* Device Permissions Section */}
@@ -467,36 +544,6 @@ export function SystemCheckPage() {
             {microphoneError && <ErrorMessage message={microphoneError} />}
           </CheckCard>
         </div>
-      </div>
-
-      {/* Configuration Section */}
-      <div className="mb-8">
-        <SectionHeader
-          title="Exam Configuration"
-          badge="Optional"
-          description="Save your exam settings for future reference"
-        />
-        <CheckCard
-          icon={FileDown}
-          title="Download Configuration File"
-          description="Export exam settings as a JSON configuration file"
-          checked={configDownloaded}
-          action={
-            <button
-              onClick={handleDownloadConfig}
-              className="px-4 py-2 rounded-lg text-[13px] bg-white border border-gray-200 text-gray-600 hover:bg-gray-50 hover:border-gray-300 transition-all cursor-pointer"
-            >
-              {configDownloaded ? (
-                <span className="flex items-center gap-1.5">
-                  <Check className="w-3.5 h-3.5 text-emerald-600" />
-                  Downloaded
-                </span>
-              ) : (
-                "Download Config"
-              )}
-            </button>
-          }
-        />
       </div>
 
       {/* Tip banner */}

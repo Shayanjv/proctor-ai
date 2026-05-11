@@ -55,6 +55,8 @@ class ExamResult(BaseModel):
     total_marks: float
     percentage: float
     status: str  # passed/failed
+    # Final admin-decided score; None == pending admin review.
+    final_score: Optional[float] = None
 
 class QuestionCreate(BaseModel):
     text: str

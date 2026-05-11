@@ -1,0 +1,70 @@
+# =============================================================================
+# Caddy reverse proxy - production
+# -----------------------------------------------------------------------------
+# Caddy automatically provisions Let's Encrypt certificates for every site
+# block via the HTTP-01 challenge on :80, so all 3 hostnames become real
+# HTTPS endpoints with zero extra config. {$PUBLIC_HOST} is read from the
+# Caddy container's environment (wired in docker-compose.prod.yml).
+#
+# Required env on the Caddy container:
+#   PUBLIC_HOST          e.g. 167-99-45-12.nip.io
+#   LETSENCRYPT_EMAIL    used as ACME account contact - any valid mailbox
+# =============================================================================
+
+# Global options
+{
+    email {$LETSENCRYPT_EMAIL}
+    # Production CA (Let's Encrypt). For initial testing or if you hit
+    # LE rate limits, swap to the staging CA by uncommenting:
+    # acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+# ---------------------------------------------------------------------------
+# Student SPA - the bare hostname is the default user-facing entry point.
+# ---------------------------------------------------------------------------
+{$PUBLIC_HOST} {
+    encode zstd gzip
+    reverse_proxy student-frontend:80
+}
+
+# ---------------------------------------------------------------------------
+# Admin SPA - on its own subdomain so it gets a separate cert and there is
+# no risk of route collision with the student app.
+# ---------------------------------------------------------------------------
+admin.{$PUBLIC_HOST} {
+    encode zstd gzip
+    reverse_proxy admin-frontend:80
+}
+
+# ---------------------------------------------------------------------------
+# Backend (FastAPI) - REST + WebSocket on a single subdomain.
+# Caddy auto-handles WebSocket Upgrade headers since v2; no extra config
+# required for /ws/* to keep long-lived bidi streams.
+# ---------------------------------------------------------------------------
+api.{$PUBLIC_HOST} {
+    encode zstd gzip
+
+    # Proctoring uploads webcam frames and screen-recording chunks via
+    # multipart POSTs. The Caddy default request body cap (10MB) is fine
+    # for individual frames but tight for screen-record chunks - raise to
+    # 64MB. Adjust if you increase chunk sizes in the frontend.
+    request_body {
+        max_size 64MB
+    }
+
+    # ML inference can legitimately take several seconds for a single
+    # frame on a cold cache. Match the backend's no-watchdog stance by
+    # disabling Caddy's idle/read timeouts for proxied requests.
+    reverse_proxy backend:8000 {
+        transport http {
+            read_timeout 0
+            write_timeout 0
+            dial_timeout 5s
+        }
+        # Pass the real client IP through so backend logs / rate-limits
+        # see the student's address, not Caddy's container IP.
+        header_up X-Real-IP {remote_host}
+        header_up X-Forwarded-For {remote_host}
+        header_up X-Forwarded-Proto {scheme}
+    }
+}

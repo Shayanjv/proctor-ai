@@ -48,6 +48,29 @@ class WarmupService:
         return bool(state.get("ready"))
 
     @classmethod
+    def wait_until_ready(cls, timeout_s: float = 60.0, poll_interval_s: float = 0.25) -> bool:
+        """
+        Block the calling thread until warmup is complete or until ``timeout_s`` elapses.
+
+        Returns True if warmup finished successfully, False on timeout or warmup error.
+        Safe to call from sync code paths. Do NOT call this from the asyncio event loop
+        thread; use ``asyncio.to_thread`` or run inside a route's threadpool worker.
+        """
+        deadline = time.time() + max(0.0, timeout_s)
+        while True:
+            with cls._lock:
+                completed = cls._state.completed_at_ms is not None
+                in_progress = cls._state.in_progress
+                last_error = cls._state.last_error
+            if completed and not last_error:
+                return True
+            if last_error and not in_progress:
+                return False
+            if time.time() >= deadline:
+                return False
+            time.sleep(poll_interval_s)
+
+    @classmethod
     def _do_warmup_sync(cls) -> None:
         """Run in a daemon thread — imports + inference, never touches the event loop."""
         try:
@@ -91,22 +114,29 @@ class WarmupService:
         Fire-and-forget warmup.  Returns current state immediately.
         Safe to call from both sync (startup) and async (endpoint) contexts.
         """
+        # IMPORTANT: never call cls.get_state() while holding cls._lock.
+        # threading.Lock is NOT reentrant, and get_state() re-acquires the
+        # same lock — calling it from inside `with cls._lock` self-deadlocks
+        # the worker thread. (This used to wedge the single uvicorn worker
+        # forever on every /exam/warmup call after the initial warmup had
+        # completed, taking the whole API down.)
+        spawn_thread = False
         with cls._lock:
-            # Already done
-            if cls._state.completed_at_ms and not cls._state.last_error:
-                return cls.get_state()
-            # Already running
-            if cls._state.in_progress:
-                return cls.get_state()
-            cls._state.in_progress = True
-            cls._state.last_error = None
-            cls._state.started_at_ms = int(time.time() * 1000)
-            cls._state.completed_at_ms = None
-            cls._state.warmup_ms = None
+            already_done = bool(cls._state.completed_at_ms and not cls._state.last_error)
+            already_running = bool(cls._state.in_progress)
+            if not already_done and not already_running:
+                cls._state.in_progress = True
+                cls._state.last_error = None
+                cls._state.started_at_ms = int(time.time() * 1000)
+                cls._state.completed_at_ms = None
+                cls._state.warmup_ms = None
+                spawn_thread = True
 
-        # Spawn a plain daemon thread — no asyncio.to_thread, no GIL deadlock,
-        # no event-loop blocking, no thread-pool exhaustion.
-        t = threading.Thread(target=cls._do_warmup_sync, daemon=True, name="warmup-detectors")
-        t.start()
-        cls._thread = t
+        if spawn_thread:
+            # Spawn a plain daemon thread — no asyncio.to_thread, no GIL deadlock,
+            # no event-loop blocking, no thread-pool exhaustion.
+            t = threading.Thread(target=cls._do_warmup_sync, daemon=True, name="warmup-detectors")
+            t.start()
+            cls._thread = t
+
         return cls.get_state()

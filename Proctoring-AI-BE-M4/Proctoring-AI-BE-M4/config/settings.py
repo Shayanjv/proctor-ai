@@ -74,6 +74,49 @@ class Settings(BaseSettings):
     SEB_CONFIG_KEY: str = Field(default=os.getenv("SEB_CONFIG_KEY", "change-me-seb-key"))
     SEB_config_key: str = Field(default=os.getenv("SEB_CONFIG_KEY", "change-me-seb-key")) # Alias used by seb_service.py
 
+    # ─────────────────────────────────────────────────────────────────────
+    # SEB auto-login redeem token.
+    #
+    # The student authenticates in their REGULAR browser (so they can paste
+    # temporary passwords / use a password manager) and clicks "Open in
+    # SEB". The FE asks the backend to mint a short-lived single-use token
+    # which is embedded into the .seb config's startURL. When SEB loads the
+    # frontend, that page redeems the token for a normal JWT — so the
+    # student never sees a login screen INSIDE Safe Exam Browser.
+    #
+    # The TTL is intentionally short: it should be long enough for SEB to
+    # cold-start (~30s on slow machines) and reach the FE, but short enough
+    # that a leaked link can't be replayed later. Single-use enforcement
+    # via the `seb_token_consumed` table makes the TTL a backstop, not the
+    # primary defence.
+    # ─────────────────────────────────────────────────────────────────────
+    SEB_TOKEN_TTL_SECONDS: int = Field(
+        default=int(os.getenv("SEB_TOKEN_TTL_SECONDS", "300"))
+    )
+
+    # ─────────────────────────────────────────────────────────────────────
+    # Mark-penalty engine (services/mark_penalty_service.py).
+    #
+    # AI-recommended deduction off the raw exam score, computed from MAJOR
+    # proctor violations only (CRITICAL events count at a multiplier).
+    # MINOR events (tab_switch, copy_paste) are *never* penalised here —
+    # they remain in the strike engine for termination but do not move
+    # marks. The admin always has the final say (Original / Adjusted /
+    # Manual) via POST /admin/session/{id}/score-decision.
+    # ─────────────────────────────────────────────────────────────────────
+    PROCTOR_MARK_PENALTY_FREE_STRIKES: int = Field(
+        default=int(os.getenv("PROCTOR_MARK_PENALTY_FREE_STRIKES", "1"))
+    )
+    PROCTOR_MARK_PENALTY_PER_MAJOR_PCT: float = Field(
+        default=float(os.getenv("PROCTOR_MARK_PENALTY_PER_MAJOR_PCT", "5"))
+    )
+    PROCTOR_MARK_PENALTY_CRITICAL_MULTIPLIER: float = Field(
+        default=float(os.getenv("PROCTOR_MARK_PENALTY_CRITICAL_MULTIPLIER", "2"))
+    )
+    PROCTOR_MARK_PENALTY_CAP_PCT: float = Field(
+        default=float(os.getenv("PROCTOR_MARK_PENALTY_CAP_PCT", "30"))
+    )
+
     # Server settings
     SERVER_HOST: str = Field(default="0.0.0.0")
     SERVER_PORT: int = Field(default=8080, alias="PORT")

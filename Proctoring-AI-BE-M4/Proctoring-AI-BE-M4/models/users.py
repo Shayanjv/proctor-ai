@@ -30,7 +30,13 @@ class User(Base):
     
     # Relationships
     logs = relationship("Log", back_populates="user")
-    exam_sessions = relationship("ExamSession", back_populates="user")
+    # ExamSession has two FKs to users (user_id, score_decision_by) so we
+    # disambiguate which one this back-populating relationship binds to.
+    exam_sessions = relationship(
+        "ExamSession",
+        back_populates="user",
+        foreign_keys="ExamSession.user_id",
+    )
     created_exams = relationship("Exam", back_populates="creator")
     evidence = relationship("Evidence", back_populates="user")
     face_references = relationship("UserFaceReference", cascade="all, delete-orphan")

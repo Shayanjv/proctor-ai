@@ -30,7 +30,10 @@ services:
       - SEED_ADMIN_PASSWORD=${SEED_ADMIN_PASSWORD}
       - SEED_STUDENT_EMAIL=${SEED_STUDENT_EMAIL}
       - SEED_STUDENT_PASSWORD=${SEED_STUDENT_PASSWORD}
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+    # NOTE: No `command:` override here on purpose. The Dockerfile CMD (gunicorn
+    # -w 1 --timeout 0 ...) is the single source of truth. An older override of
+    # `uvicorn --reload` was removed because it silently conflicted with the
+    # Dockerfile during docker-compose builds and caused workers to be killed.
     depends_on:
       db:
         condition: service_healthy

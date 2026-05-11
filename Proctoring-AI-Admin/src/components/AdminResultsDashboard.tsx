@@ -85,6 +85,13 @@ interface Attempt {
   last_active: string | null;
   duration_minutes: number;
   exam_title: string | null;
+  // Mark-penalty / score-decision (None = pending admin review).
+  major_violation_count: number | null;
+  critical_violation_count: number | null;
+  proctor_penalty_pct: number | null;
+  proctor_adjusted_score: number | null;
+  final_score: number | null;
+  score_decision: 'raw' | 'penalised' | 'manual' | null;
 }
 
 interface ExamDetail {
@@ -296,11 +303,19 @@ export function AdminResultsDashboard({
     }
     exportCsv(
       `${(detail?.exam.title || 'exam').replace(/[^a-zA-Z0-9]+/g, '-').toLowerCase()}-results.csv`,
-      ['Session ID', 'Student', 'Email', 'Status', 'Tier', 'Score', 'Score %', 'Compliance %', 'Violations', 'Evidence', 'Last Active'],
+      [
+        'Session ID', 'Student', 'Email', 'Status', 'Tier',
+        'Score', 'Score %', 'Compliance %',
+        'Final Score', 'Decision',
+        'Violations', 'Evidence', 'Last Active',
+      ],
       filteredAttempts.map((item) => [
         item.session_id, item.full_name, item.email, item.status, item.tier,
         `${item.score}/${item.total_marks}`, formatPercent(item.score_percentage),
-        formatPercent(item.compliance), item.violation_count, item.evidence_count,
+        formatPercent(item.compliance),
+        item.final_score !== null ? `${item.final_score}/${item.total_marks}` : 'Pending',
+        item.score_decision || 'pending',
+        item.violation_count, item.evidence_count,
         formatServerDateTime(item.last_active),
       ]),
     );
@@ -686,7 +701,7 @@ export function AdminResultsDashboard({
                       <table className="w-full min-w-[900px]">
                         <thead>
                           <tr style={{ background: 'rgba(255,255,255,0.03)', borderBottom: '1px solid rgba(255,255,255,0.06)' }}>
-                            {['Student', 'Status', 'Risk Tier', 'Score', 'Integrity', 'Violations', 'Last Active', 'Actions'].map((h) => (
+                            {['Student', 'Status', 'Risk Tier', 'Score', 'Final', 'Integrity', 'Violations', 'Last Active', 'Actions'].map((h) => (
                               <th key={h} className="px-5 py-4 text-left text-[10px] font-bold uppercase tracking-widest text-slate-600">{h}</th>
                             ))}
                           </tr>
@@ -694,7 +709,7 @@ export function AdminResultsDashboard({
                         <tbody>
                           {filteredAttempts.length === 0 ? (
                             <tr>
-                              <td colSpan={8} className="px-5 py-16 text-center">
+                              <td colSpan={9} className="px-5 py-16 text-center">
                                 <div className="flex flex-col items-center gap-3 text-slate-600">
                                   <Users className="h-10 w-10 opacity-30" />
                                   <p className="text-sm">No participants match your search</p>
@@ -741,6 +756,39 @@ export function AdminResultsDashboard({
                                       </div>
                                       <p className="text-[10px] text-slate-500 mt-0.5">{formatPercent(item.score_percentage)}</p>
                                     </div>
+                                  </td>
+                                  {/* Final score column — admin's committed decision, or Pending. */}
+                                  <td className="px-5 py-4">
+                                    {item.final_score !== null && item.score_decision ? (
+                                      <div>
+                                        <p className="text-sm font-bold text-emerald-300">
+                                          {item.final_score}
+                                          <span className="text-slate-600">/{item.total_marks}</span>
+                                        </p>
+                                        <span
+                                          className={`mt-1 inline-flex rounded-md px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
+                                            item.score_decision === 'raw'
+                                              ? 'bg-amber-500/15 text-amber-300 border border-amber-400/30'
+                                              : item.score_decision === 'penalised'
+                                              ? 'bg-emerald-500/15 text-emerald-300 border border-emerald-400/30'
+                                              : 'bg-cyan-500/15 text-cyan-300 border border-cyan-400/30'
+                                          }`}
+                                        >
+                                          {item.score_decision === 'raw'
+                                            ? 'Original'
+                                            : item.score_decision === 'penalised'
+                                            ? 'AI Adjusted'
+                                            : 'Manual'}
+                                        </span>
+                                      </div>
+                                    ) : (
+                                      <div>
+                                        <p className="text-sm font-bold text-slate-500">—</p>
+                                        <span className="mt-1 inline-flex items-center gap-1 rounded-md border border-amber-400/30 bg-amber-500/15 px-2 py-0.5 text-[9px] font-bold uppercase tracking-wider text-amber-300">
+                                          <Shield className="h-2.5 w-2.5" /> Pending
+                                        </span>
+                                      </div>
+                                    )}
                                   </td>
                                   <td className="px-5 py-4">
                                     <p className="text-sm font-bold" style={{ color: asNumber(item.compliance) >= 80 ? '#22c55e' : asNumber(item.compliance) >= 50 ? '#f59e0b' : '#ef4444' }}>

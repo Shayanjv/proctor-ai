@@ -12,6 +12,8 @@ import {
 } from 'lucide-react';
 import api from '../services/api';
 import { formatServerTime } from '../utils/dateTime';
+import { ScoreDecisionCard } from './ScoreDecisionCard';
+import type { SessionScoreDecision } from '../services/scoreDecision';
 
 interface StudentSummaryModalProps {
     studentId: number | null;
@@ -43,16 +45,7 @@ interface SummaryData {
         title: string;
         duration_minutes: number;
     };
-    session: {
-        id: number;
-        status: string;
-        score: number;
-        total_marks: number;
-        percentage: number;
-        start_time: string;
-        end_time: string;
-        compliance: number;
-    };
+    session: SessionScoreDecision;
     questions: QuestionDetail[];
     violations: Array<{
         type: string;
@@ -68,12 +61,6 @@ export function StudentSummaryModal({ studentId, isOpen, onClose }: StudentSumma
     const [data, setData] = useState<SummaryData | null>(null);
 
     useEffect(() => {
-        console.log('StudentSummaryModal: mounted');
-        return () => console.log('StudentSummaryModal: unmounted');
-    }, []);
-
-    useEffect(() => {
-        console.log('StudentSummaryModal: isOpen changed to:', isOpen, 'studentId:', studentId);
         if (isOpen && studentId) {
             fetchSummary();
         }
@@ -81,14 +68,11 @@ export function StudentSummaryModal({ studentId, isOpen, onClose }: StudentSumma
 
     const fetchSummary = async () => {
         if (!studentId) return;
-
-        console.log('StudentSummaryModal: Fetching summary for student:', studentId);
         setLoading(true);
         setError(null);
 
         try {
             const response = await api.get(`exam/admin/summary/student/${studentId}`);
-            console.log('StudentSummaryModal: Data fetched successfully:', response.data);
             setData(response.data);
         } catch (err: any) {
             console.error('StudentSummaryModal: Fetch error:', err);
@@ -97,8 +81,6 @@ export function StudentSummaryModal({ studentId, isOpen, onClose }: StudentSumma
             setLoading(false);
         }
     };
-
-    console.log('StudentSummaryModal: Rendering, isOpen:', isOpen, 'loading:', loading, 'hasData:', !!data);
 
     if (!isOpen) return null;
 
@@ -113,12 +95,6 @@ export function StudentSummaryModal({ studentId, isOpen, onClose }: StudentSumma
                 style={{ zIndex: 99999 }}
                 onClick={onClose}
             >
-                <button
-                    className="fixed top-4 left-4 bg-red-600 text-white p-2 z-[100000]"
-                    onClick={() => alert('Modal is open! If you see this but not the card, it is a layering issue.')}
-                >
-                    DEBUG: Modal Active
-                </button>
                 <motion.div
                     initial={{ scale: 0.95, opacity: 0, y: 20 }}
                     animate={{ scale: 1, opacity: 1, y: 0 }}
@@ -216,6 +192,16 @@ export function StudentSummaryModal({ studentId, isOpen, onClose }: StudentSumma
                                         </div>
                                         <p className="text-2xl font-bold text-cyan-400">{data.session.compliance}%</p>
                                     </div>
+                                </div>
+
+                                {/* Final Score Decision card — admin picks Original / AI Penalty / Manual. */}
+                                <div className="mb-6">
+                                    <ScoreDecisionCard
+                                        session={data.session}
+                                        onSaved={(next) => {
+                                            setData((prev) => (prev ? { ...prev, session: next } : prev));
+                                        }}
+                                    />
                                 </div>
 
                                 {/* Questions Section */}

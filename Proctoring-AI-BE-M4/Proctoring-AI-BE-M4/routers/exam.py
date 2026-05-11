@@ -27,6 +27,7 @@ from models.questions import Question
 from models.sessions import ExamSession
 from models.policy_audit import PolicyAudit
 from services.seb_service import SEBService
+from services.mark_penalty_service import MarkPenaltyService
 from models.settings import SystemSettings
 from models.exam_eligible_students import ExamEligibleStudent
 from models.user_password_reset_requirements import UserPasswordResetRequirement
@@ -65,6 +66,135 @@ async def warmup_proctoring_status(
 ):
     """Return current warmup readiness state."""
     return WarmupService.get_state()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Safe Exam Browser (SEB) — config file endpoint
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Returns an XML-plist .seb file that SEB consumes to launch the lobby page
+# of a given exam in lockdown mode. The endpoint is intentionally public:
+# the .seb file only carries the public lobby URL (which the student would
+# see anyway), and the lobby itself is still protected by JWT auth + the
+# student must complete identity verification before /exam/start. A leaked
+# .seb leaks nothing — it just opens a login screen in SEB.
+#
+# Frontend builds the launch link as:
+#   seb://<api-host>/api/v1/exam/<exam_id>/seb-config.seb?return_to=<lobby-url>
+# (OS hands the seb:// URL to Safe Exam Browser, which fetches over https.)
+# ─────────────────────────────────────────────────────────────────────────────
+
+from urllib.parse import urlparse  # noqa: E402  (kept local to this section)
+from xml.sax.saxutils import escape as _xml_escape  # noqa: E402
+
+
+def _is_safe_return_url(url: str) -> bool:
+    """Allow only http(s) URLs; reject anything else to keep the .seb plist clean."""
+    if not url:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if not parsed.netloc:
+        return False
+    return True
+
+
+def _build_seb_plist(start_url: str, quit_url: str) -> str:
+    """
+    Build a minimal-but-valid .seb XML plist that opens `start_url` in lockdown.
+
+    `quit_url` is a *sentinel* the FE programmatically navigates to (not a
+    real route): when SEB sees a navigation to this URL it auto-closes
+    itself. Combined with `quitURLConfirm=false` this gives a
+    no-prompt auto-exit on exam termination / completion.
+    """
+    safe_start = _xml_escape(start_url)
+    safe_quit = _xml_escape(quit_url)
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" '
+        '"http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        '<plist version="1.0">\n'
+        '<dict>\n'
+        '    <key>sebMode</key><integer>0</integer>\n'
+        '    <key>sebConfigPurpose</key><integer>0</integer>\n'
+        f'    <key>startURL</key><string>{safe_start}</string>\n'
+        f'    <key>quitURL</key><string>{safe_quit}</string>\n'
+        '    <key>quitURLConfirm</key><false/>\n'
+        '    <key>browserViewMode</key><integer>1</integer>\n'
+        '    <key>browserWindowAllowReload</key><true/>\n'
+        '    <key>showReloadButton</key><false/>\n'
+        '    <key>showTaskBar</key><false/>\n'
+        '    <key>allowQuit</key><true/>\n'
+        '    <key>hashedQuitPassword</key><string></string>\n'
+        '    <key>URLFilterEnable</key><false/>\n'
+        '    <key>allowVirtualMachine</key><false/>\n'
+        '    <key>enableLogging</key><false/>\n'
+        '    <key>allowSpellCheck</key><false/>\n'
+        '    <key>allowFlashFullscreen</key><false/>\n'
+        '</dict>\n'
+        '</plist>\n'
+    )
+
+
+@router.get("/{exam_id}/seb-config.seb")
+async def get_exam_seb_config(
+    exam_id: int,
+    request: Request,
+    return_to: Optional[str] = Query(default=None),
+    seb_token: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db),
+):
+    """
+    Serve a Safe Exam Browser config file that, when opened by SEB, launches
+    the lobby page for `exam_id` in lockdown mode.
+
+    Public endpoint — the .seb file contains only public URLs. Real auth
+    happens once SEB loads the lobby page. When the FE supplies an
+    `seb_token` query param (issued by POST /auth/seb-token before the
+    seb:// hand-off), it is forwarded verbatim into the start URL so the
+    FE running inside SEB can redeem it for a JWT and skip the login
+    screen entirely.
+    """
+    exam = db.query(Exam).filter(Exam.id == exam_id, Exam.is_active == True).first()  # noqa: E712
+    if exam is None:
+        raise HTTPException(status_code=404, detail="Exam not found")
+
+    # Determine where SEB should navigate after launch.
+    # 1) Trust ?return_to=<url> if it is a safe http(s) URL (lets the FE pass
+    #    its own origin so dev (5174) and prod (deployed origin) both work).
+    # 2) Fall back to STUDENT_FRONTEND_URL from settings.
+    candidate = return_to or settings.STUDENT_FRONTEND_URL or ""
+    if not _is_safe_return_url(candidate):
+        raise HTTPException(
+            status_code=400,
+            detail="No valid student frontend URL configured. Pass ?return_to=<https-url> or set STUDENT_FRONTEND_URL.",
+        )
+
+    base = candidate.rstrip("/")
+    start_url = f"{base}/exam/{exam_id}"
+    # Dedicated sentinel route — must NOT collide with any real FE page,
+    # because SEB auto-closes the moment it sees navigation to this URL.
+    quit_url = f"{base}/seb-quit"
+
+    # Bake the single-use redeem token into the start URL so the FE can
+    # auto-login when SEB loads the page (no second password screen
+    # inside the locked-down browser).
+    if seb_token:
+        from urllib.parse import quote
+        start_url = f"{start_url}?seb_token={quote(seb_token, safe='')}"
+
+    plist = _build_seb_plist(start_url=start_url, quit_url=quit_url)
+    headers = {
+        "Content-Disposition": f'attachment; filename="exam-{exam_id}.seb"',
+        "Cache-Control": "no-store",
+    }
+    return Response(content=plist, media_type="application/seb", headers=headers)
+
 
 # Initialize thread pool for frame processing
 frame_executor = ThreadPoolExecutor(max_workers=4)
@@ -408,7 +538,6 @@ def _build_admin_live_payload(db: Session) -> Dict[str, Any]:
         if session:
             session_id = session.id
             score = float(session.score or 0)
-            compliance = float(session.overall_compliance) if session.overall_compliance is not None else None
 
             if last_active is None:
                 last_active = session.end_time or session.start_time
@@ -437,7 +566,15 @@ def _build_admin_live_payload(db: Session) -> Dict[str, Any]:
             if session.end_time:
                 violation_query = violation_query.filter(Log.timestamp <= session.end_time)
 
-            violation_count = violation_query.count()
+            violation_logs = violation_query.all()
+            violation_count = len(violation_logs)
+
+            if session.overall_compliance is not None:
+                compliance = float(session.overall_compliance)
+            else:
+                from services.mark_penalty_service import MarkPenaltyService
+                penalty_result = MarkPenaltyService.compute_from_logs(violation_logs, raw_score=score, total_marks=total_marks)
+                compliance = max(0.0, 100.0 - penalty_result.penalty_pct)
 
             # Policy/enforcement state for admin parity (best-effort).
             try:
@@ -765,6 +902,64 @@ def _get_session_evidence_records(db: Session, session: ExamSession) -> List[Evi
     return query.order_by(Evidence.timestamp.asc()).all()
 
 
+def _build_session_summary_dict(
+    session: ExamSession,
+    *,
+    total_marks: float,
+    db: Session,
+) -> Dict[str, Any]:
+    """
+    Shared shape for the `session` block returned by both admin summary
+    endpoints (`/admin/summary/session/{id}` and `/admin/summary/student/{id}`).
+
+    Includes the mark-penalty / score-decision fields so the FE can render
+    the "Final Score Decision" card consistently.
+    """
+    raw_score = float(session.score or 0.0)
+    pct = round((raw_score / total_marks) * 100, 2) if total_marks and total_marks > 0 else 0.0
+
+    major_v = int(session.major_violation_count) if session.major_violation_count is not None else None
+    critical_v = int(session.critical_violation_count) if session.critical_violation_count is not None else None
+    penalty_pct = float(session.proctor_penalty_pct) if session.proctor_penalty_pct is not None else None
+    adjusted = float(session.proctor_adjusted_score) if session.proctor_adjusted_score is not None else None
+    final_sc = float(session.final_score) if session.final_score is not None else None
+    decision = session.score_decision if session.score_decision else None
+
+    decided_by_email: Optional[str] = None
+    if session.score_decision_by:
+        try:
+            decider = db.query(User).filter(User.id == session.score_decision_by).first()
+            if decider:
+                decided_by_email = decider.email
+        except Exception:
+            decided_by_email = None
+
+    return {
+        "id": int(session.id),
+        "status": session.status,
+        "score": round(raw_score, 2),
+        "total_marks": round(float(total_marks or 0.0), 2),
+        "percentage": pct,
+        "start_time": utc_iso(session.start_time),
+        "end_time": utc_iso(session.end_time),
+        "compliance": (
+            round(float(session.overall_compliance), 2)
+            if session.overall_compliance is not None
+            else 100.0
+        ),
+        # Mark-penalty / score-decision (None = pending admin review).
+        "major_violation_count": major_v,
+        "critical_violation_count": critical_v,
+        "proctor_penalty_pct": round(penalty_pct, 2) if penalty_pct is not None else None,
+        "proctor_adjusted_score": round(adjusted, 2) if adjusted is not None else None,
+        "final_score": round(final_sc, 2) if final_sc is not None else None,
+        "score_decision": decision,
+        "score_decision_by": decided_by_email,
+        "score_decision_at": utc_iso(session.score_decision_at) if session.score_decision_at else None,
+        "penalty_config": MarkPenaltyService.config_snapshot(),
+    }
+
+
 def _build_admin_exam_result_participant(
     db: Session,
     session: ExamSession,
@@ -784,7 +979,8 @@ def _build_admin_exam_result_participant(
         now_utc=now_utc,
     )
 
-    violation_count = _get_session_violation_logs_query(db, session).count()
+    violation_logs = _get_session_violation_logs_query(db, session).all()
+    violation_count = len(violation_logs)
     tier = _derive_risk_tier(violation_count)
 
     saved_answers = session.saved_answers if isinstance(session.saved_answers, dict) else {}
@@ -792,9 +988,23 @@ def _build_admin_exam_result_participant(
     progress = round((answered_count / total_questions) * 100, 2) if total_questions > 0 else 0.0
 
     score = float(session.score or 0.0)
-    compliance = float(session.overall_compliance) if session.overall_compliance is not None else None
+    if session.overall_compliance is not None:
+        compliance = float(session.overall_compliance)
+    else:
+        from services.mark_penalty_service import MarkPenaltyService
+        penalty_result = MarkPenaltyService.compute_from_logs(violation_logs, raw_score=score, total_marks=total_marks)
+        compliance = max(0.0, 100.0 - penalty_result.penalty_pct)
     score_percentage = round((score / total_marks) * 100, 2) if total_marks > 0 else None
     evidence_count = len(_get_session_evidence_records(db, session))
+
+    # Mark-penalty fields (computed by MarkPenaltyService). NULL means the
+    # session pre-dates the feature — will self-heal on first summary view.
+    major_v = int(session.major_violation_count) if session.major_violation_count is not None else None
+    critical_v = int(session.critical_violation_count) if session.critical_violation_count is not None else None
+    penalty_pct = float(session.proctor_penalty_pct) if session.proctor_penalty_pct is not None else None
+    adjusted = float(session.proctor_adjusted_score) if session.proctor_adjusted_score is not None else None
+    final_sc = float(session.final_score) if session.final_score is not None else None
+    decision = session.score_decision if session.score_decision else None
 
     return {
         "id": int(student.id) if student else int(session.user_id),
@@ -819,6 +1029,13 @@ def _build_admin_exam_result_participant(
         "answered_count": answered_count,
         "question_count": total_questions,
         "evidence_count": evidence_count,
+        # Mark-penalty / score-decision (None = pending admin review).
+        "major_violation_count": major_v,
+        "critical_violation_count": critical_v,
+        "proctor_penalty_pct": round(penalty_pct, 2) if penalty_pct is not None else None,
+        "proctor_adjusted_score": round(adjusted, 2) if adjusted is not None else None,
+        "final_score": round(final_sc, 2) if final_sc is not None else None,
+        "score_decision": decision,
     }
 
 
@@ -944,9 +1161,23 @@ async def start_exam_session(
     db: Session = Depends(get_db)
 ):
     """Start exam session with authorization"""
+    import time as _t
+    _t_marks = {"start": _t.perf_counter()}
     try:
+        # 0. Make sure the detector pipeline is warm before the student enters
+        # the exam. If startup-warmup already completed this is a no-op; if it
+        # is still in progress (rare — only on a cold container) we block here
+        # at the start endpoint so the wait happens BEFORE the exam UI loads,
+        # rather than as an opaque "Preparing your questions..." hang later.
+        if not WarmupService.is_ready():
+            # Kick warmup if it never started, then wait off the event loop.
+            WarmupService.start_warmup()
+            await asyncio.to_thread(WarmupService.wait_until_ready, 60.0)
+        _t_marks["warmup"] = _t.perf_counter()
+
         # 1. Validate Safe Exam Browser (SEB)
         SEBService.validate_request(request)
+        _t_marks["seb"] = _t.perf_counter()
 
         # Extract token and verify
         token = credentials.credentials
@@ -1007,6 +1238,15 @@ async def start_exam_session(
                     "session": str(session.id),
                     "type": "websocket"
                 })
+                _t_marks["end"] = _t.perf_counter()
+                _segs = list(_t_marks.items())
+                _segments = " ".join(
+                    f"{_segs[i+1][0]}={(_segs[i+1][1]-_segs[i][1])*1000:.1f}ms"
+                    for i in range(len(_segs)-1)
+                )
+                logger.info(
+                    f"[Timing] POST /exam/start/{user_id} (resumed) total={(_t_marks['end']-_t_marks['start'])*1000:.1f}ms {_segments}"
+                )
 
                 return {
                     "message": "Session resumed",
@@ -1071,16 +1311,27 @@ async def start_exam_session(
             db.commit()
             db.refresh(session)
         
+        _t_marks["session"] = _t.perf_counter()
         session_info = get_session_info(user_id, db)
+        _t_marks["session_info"] = _t.perf_counter()
         base_url = _resolve_ws_base_url(request)
-        
+
         # Generate WebSocket tokens
         ws_token = create_access_token({
             "sub": str(user_id),
             "session": str(session.id),
             "type": "websocket"
         })
-        
+        _t_marks["end"] = _t.perf_counter()
+        _segs = list(_t_marks.items())
+        _segments = " ".join(
+            f"{_segs[i+1][0]}={(_segs[i+1][1]-_segs[i][1])*1000:.1f}ms"
+            for i in range(len(_segs)-1)
+        )
+        logger.info(
+            f"[Timing] POST /exam/start/{user_id} (new) total={(_t_marks['end']-_t_marks['start'])*1000:.1f}ms {_segments}"
+        )
+
         return {
             "message": "Session established",
             "status": session.status,
@@ -1569,6 +1820,22 @@ async def get_session_attempt_summary(
         if student.image:
             user_image = base64.b64encode(student.image).decode('utf-8')
 
+        # Lazy recompute so old sessions self-heal on first admin view.
+        try:
+            from services.grading_service import GradingService as _GS
+            _GS._recompute_proctor_decision(
+                db=db,
+                session=session,
+                raw_score=float(session.score or 0.0),
+                total_marks=float(total_marks or 0.0),
+            )
+            db.commit()
+        except Exception as _exc:
+            logger.warning(
+                f"Lazy penalty recompute failed for session {session.id}: {_exc}"
+            )
+            db.rollback()
+
         return {
             "student": {
                 "id": student.id,
@@ -1581,16 +1848,7 @@ async def get_session_attempt_summary(
                 "title": exam.title if exam else "Unknown Exam",
                 "duration_minutes": exam.duration_minutes if exam else 0
             },
-            "session": {
-                "id": session.id,
-                "status": session.status,
-                "score": session.score or 0,
-                "total_marks": round(total_marks, 2),
-                "percentage": round((float(session.score or 0) / total_marks) * 100, 2) if total_marks > 0 else 0,
-                "start_time": utc_iso(session.start_time),
-                "end_time": utc_iso(session.end_time),
-                "compliance": session.overall_compliance or 100
-            },
+            "session": _build_session_summary_dict(session, total_marks=total_marks, db=db),
             "questions": question_details,
             "violations": violation_details,
             "violation_count": len(violations)
@@ -1670,6 +1928,22 @@ async def get_student_exam_summary(
         if student.image:
             user_image = base64.b64encode(student.image).decode('utf-8')
         
+        # Lazy recompute so old sessions self-heal on first admin view.
+        try:
+            from services.grading_service import GradingService as _GS
+            _GS._recompute_proctor_decision(
+                db=db,
+                session=session,
+                raw_score=float(session.score or 0.0),
+                total_marks=float(total_marks or 0.0),
+            )
+            db.commit()
+        except Exception as _exc:
+            logger.warning(
+                f"Lazy penalty recompute failed for session {session.id}: {_exc}"
+            )
+            db.rollback()
+
         return {
             "student": {
                 "id": student.id,
@@ -1682,16 +1956,7 @@ async def get_student_exam_summary(
                 "title": exam.title if exam else "Unknown Exam",
                 "duration_minutes": exam.duration_minutes if exam else 0
             },
-            "session": {
-                "id": session.id,
-                "status": session.status,
-                "score": session.score or 0,
-                "total_marks": total_marks,
-                "percentage": round((session.score or 0) / total_marks * 100, 2) if total_marks > 0 else 0,
-                "start_time": utc_iso(session.start_time),
-                "end_time": utc_iso(session.end_time),
-                "compliance": session.overall_compliance or 100
-            },
+            "session": _build_session_summary_dict(session, total_marks=float(total_marks), db=db),
             "questions": question_details,
             "violations": violation_details,
             "violation_count": len(violations)
@@ -1701,6 +1966,161 @@ async def get_student_exam_summary(
     except Exception as e:
         logger.error(f"Student summary fetch failed for user {user_id}: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch student summary: {str(e)}")
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Admin score-decision endpoint
+#
+# Lets the admin commit a final mark for a student attempt by picking one of
+# three options:
+#   - "raw"       → award the raw correctness score unchanged
+#   - "penalised" → award the AI-recommended adjusted score
+#   - "manual"    → admin types a number in [0, total_marks]
+#
+# Each call updates `final_score`, `score_decision`, `score_decision_by`,
+# `score_decision_at` on the ExamSession AND writes a PolicyAudit row so
+# the override is traceable. The penalty fields themselves are NOT
+# overwritten — they stay as the AI recommendation snapshot.
+# ─────────────────────────────────────────────────────────────────────────
+
+class ScoreDecisionRequest(BaseModel):
+    """Body for POST /admin/session/{session_id}/score-decision."""
+    decision: str  # "raw" | "penalised" | "manual"
+    manual_score: Optional[float] = None
+
+
+@router.post("/admin/session/{session_id}/score-decision")
+async def set_session_score_decision(
+    session_id: int,
+    payload: ScoreDecisionRequest,
+    current_user: User = Depends(get_current_admin_user),
+    db: Session = Depends(get_db),
+):
+    """Commit the final exam score for a student attempt (admin only)."""
+    decision = (payload.decision or "").strip().lower()
+    if decision not in {"raw", "penalised", "manual"}:
+        raise HTTPException(
+            status_code=400,
+            detail="decision must be one of: raw, penalised, manual",
+        )
+
+    session = db.query(ExamSession).filter(ExamSession.id == session_id).first()
+    if not session:
+        raise HTTPException(status_code=404, detail="Exam session not found")
+
+    # Total marks for this attempt — needed for both validation and for the
+    # response shape (and to recompute the penalty if it's missing).
+    questions = []
+    if session.exam_id:
+        questions = db.query(Question).filter(Question.exam_id == session.exam_id).all()
+    total_marks = float(sum(float(q.marks or 0) for q in questions))
+
+    raw_score = float(session.score or 0.0)
+
+    # Make sure the AI recommendation is up-to-date before we use it. This
+    # also self-heals sessions that pre-date the feature.
+    try:
+        GradingService._recompute_proctor_decision(  # type: ignore[attr-defined]
+            db=db,
+            session=session,
+            raw_score=raw_score,
+            total_marks=total_marks,
+        )
+    except Exception as exc:
+        logger.warning(
+            f"Score-decision: penalty recompute failed for session {session_id}: {exc}"
+        )
+
+    # Resolve the chosen final score.
+    if decision == "raw":
+        final_value = raw_score
+    elif decision == "penalised":
+        final_value = float(
+            session.proctor_adjusted_score
+            if session.proctor_adjusted_score is not None
+            else raw_score
+        )
+    else:  # manual
+        if payload.manual_score is None:
+            raise HTTPException(
+                status_code=422,
+                detail="manual_score is required when decision == 'manual'",
+            )
+        try:
+            final_value = float(payload.manual_score)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="manual_score must be a number")
+        if final_value < 0 or (total_marks > 0 and final_value > total_marks):
+            raise HTTPException(
+                status_code=422,
+                detail=f"manual_score must be between 0 and {total_marks}",
+            )
+
+    final_value = round(max(0.0, float(final_value)), 2)
+
+    # Persist the decision on the session.
+    session.final_score = final_value
+    session.score_decision = decision
+    session.score_decision_by = int(current_user.id)
+    session.score_decision_at = datetime.utcnow()
+
+    # Audit row — captures the rule snapshot so the override is replayable.
+    try:
+        audit = PolicyAudit(
+            user_id=int(session.user_id),
+            session_id=int(session.id),
+            exam_id=int(session.exam_id) if session.exam_id else None,
+            action="score_decision",
+            reason=decision,
+            trigger_source="admin",
+            details={
+                "raw_score": raw_score,
+                "proctor_adjusted_score": (
+                    float(session.proctor_adjusted_score)
+                    if session.proctor_adjusted_score is not None
+                    else None
+                ),
+                "proctor_penalty_pct": (
+                    float(session.proctor_penalty_pct)
+                    if session.proctor_penalty_pct is not None
+                    else None
+                ),
+                "major_violation_count": (
+                    int(session.major_violation_count)
+                    if session.major_violation_count is not None
+                    else None
+                ),
+                "critical_violation_count": (
+                    int(session.critical_violation_count)
+                    if session.critical_violation_count is not None
+                    else None
+                ),
+                "final_score": final_value,
+                "manual_score_input": payload.manual_score,
+            },
+            thresholds=MarkPenaltyService.config_snapshot(),
+            trigger_event_types=[],
+            evidence_url=None,
+        )
+        db.add(audit)
+    except Exception as exc:
+        logger.debug(f"Failed to create PolicyAudit row for score-decision: {exc}")
+
+    try:
+        db.commit()
+        db.refresh(session)
+    except Exception as exc:
+        db.rollback()
+        logger.error(
+            f"Failed to persist score-decision for session {session_id}: {exc}",
+            exc_info=True,
+        )
+        raise HTTPException(status_code=500, detail="Failed to save score decision")
+
+    return {
+        "session": _build_session_summary_dict(session, total_marks=total_marks, db=db),
+    }
+
 
 @router.post("/pause/{user_id}")
 def pause_exam_session(user_id: int):
@@ -1881,27 +2301,35 @@ async def force_close_session(
 
 @router.get("/summary/{user_id}", response_model=ExamSummary)
 async def get_exam_summary(
-    user_id: int, 
+    user_id: int,
     credentials: HTTPAuthorizationCredentials = Security(security),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    include_image: bool = True,
 ):
-    """Get exam summary for a user"""
+    """Get exam summary for a user.
+
+    The user's profile photo is base64-encoded inside the response by default
+    for backward compatibility. Clients on slow networks (e.g. the student
+    Summary screen) can pass ``?include_image=false`` to omit it and fetch
+    the raw bytes lazily from ``/api/v1/auth/me/image`` instead — avoiding
+    the ~kilobytes-of-JSON cost on the critical post-exam path.
+    """
     try:
         current_user = get_current_user(credentials.credentials, db)
         if current_user.id != user_id and current_user.role != "admin":
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized to view this summary")
-        
+
         # Get all logs except session stop events
         logs = db.query(Log).filter(
             Log.user_id == user_id,
             Log.event_type.notin_(list(SYSTEM_EVENT_TYPES))
         ).all()
-        
+
         if not logs:
             # No logs found - return a default summary instead of 404
             user = db.query(User).filter(User.id == user_id).first()
             user_image = None
-            if user and user.image:
+            if include_image and user and user.image:
                 user_image = base64.b64encode(user.image).decode('utf-8')
             
             return ExamSummary(
@@ -1938,38 +2366,83 @@ async def get_exam_summary(
                     "event": log.log
                 })
 
-        # Process violations:
-        # - Always include major violations on first occurrence
-        # - Include minor termination categories when their threshold is reached
-        # - Keep existing frequency-based inclusion for all other events
+        # ─────────────────────────────────────────────────────────────────
+        # Build `suspicious_activities` — what the student sees under
+        # "Major Violations" on the Summary screen.
+        #
+        # Strict rule: ONLY events in MAJOR_VIOLATION_EVENT_TYPES are
+        # surfaced here. Warning-only events (face_outside_box,
+        # face_partially_visible, eye_movement, mouth_movement,
+        # head_posture, hand_detected, audio_anomaly, etc.) and minor
+        # events (tab_switch, copy_paste) are *excluded*: they're audit
+        # signals, not majors. Previously a `> 10` frequency catch-all
+        # branch was promoting noisy warnings (e.g. face_outside_box
+        # during a wobbly setup) into the Majors list, which was
+        # misleading to both students and admins.
+        # ─────────────────────────────────────────────────────────────────
         suspicious_activities = {}
         for event_type, violations in violation_tracking.items():
+            if event_type not in MAJOR_VIOLATION_EVENT_TYPES:
+                continue
             violation_count = len(violations)
-            include_violation = False
+            if violation_count < 1:
+                continue
+            first_violation = min(violations, key=lambda x: x["timestamp"])
+            suspicious_activities[event_type] = {
+                "count": violation_count,
+                "first_occurrence": utc_iso(first_violation["timestamp"])
+            }
 
-            if event_type in MAJOR_VIOLATION_EVENT_TYPES:
-                include_violation = violation_count >= 1
-            elif event_type in MINOR_TERMINATION_THRESHOLDS:
-                include_violation = violation_count >= MINOR_TERMINATION_THRESHOLDS[event_type]
-            else:
-                include_violation = violation_count > 10
-
-            if include_violation:
-                first_violation = min(violations, key=lambda x: x["timestamp"])
-                suspicious_activities[event_type] = {
-                    "count": violation_count,
-                    "first_occurrence": utc_iso(first_violation["timestamp"])
-                }
-                
-        # Calculate suspicious weight from all included suspicious activities
-        suspicious_weight = sum(
-            violation["count"]
-            for violation in suspicious_activities.values()
-        )
-        
-        # Calculate overall compliance
+        # ─────────────────────────────────────────────────────────────────
+        # Compliance score (0..100) — derived from MAJOR / CRITICAL counts
+        # only, using the same configurable weights as the mark-penalty
+        # engine so "compliance %" and the AI-recommended deduction tell
+        # a consistent story.
+        #
+        # OLD formula (removed):
+        #   overall_compliance = face_detection_rate - (majors/total_logs * 20)
+        # Two bugs there:
+        #   1. `face_detection_rate` made compliance depend on how many
+        #      `face_detected` logs were emitted, which is a function of
+        #      log cadence, not student conduct.
+        #   2. Dividing by `len(logs)` meant adding noisy warning logs
+        #      INCREASED the denominator and REDUCED the penalty — the
+        #      opposite of the intended behaviour.
+        #
+        # NEW formula:
+        #   compliance = max(0, 100 - penalty_pct)
+        #   penalty_pct = max(0, majors - free_strikes) * per_major_pct
+        #               +              criticals       * per_critical_pct
+        # `face_detection_rate` is kept in the response for the audit/UX
+        # ("Face Detection Rate: X%") but no longer drives compliance.
+        # ─────────────────────────────────────────────────────────────────
         face_detection_rate = float((face_detections / len(logs)) * 100 if len(logs) > 0 else 0.0)
-        overall_compliance = max(0.0, face_detection_rate - float(suspicious_weight / len(logs) * 20))
+
+        # Count MAJOR (non-critical) and CRITICAL occurrences from the
+        # cleansed suspicious_activities. We use the canonical service
+        # constants so the split here always matches the mark-penalty
+        # engine.
+        from services.mark_penalty_service import CRITICAL_VIOLATION_EVENT_TYPES
+        major_non_critical_count = 0
+        critical_count = 0
+        for event_type, payload in suspicious_activities.items():
+            count = int(payload.get("count", 0) or 0)
+            if event_type in CRITICAL_VIOLATION_EVENT_TYPES:
+                critical_count += count
+            else:
+                major_non_critical_count += count
+
+        penalty_config = MarkPenaltyService.config_snapshot()
+        free_strikes = int(penalty_config["free_strikes"])
+        per_major_pct = float(penalty_config["per_major_pct"])
+        per_critical_pct = float(penalty_config["per_critical_pct"])
+
+        major_after_grace = max(0, major_non_critical_count - free_strikes)
+        compliance_penalty = (
+            (major_after_grace * per_major_pct)
+            + (critical_count * per_critical_pct)
+        )
+        overall_compliance = max(0.0, 100.0 - compliance_penalty)
         
         # 5. Persistent Session Update
         session = db.query(ExamSession).filter(
@@ -1980,6 +2453,39 @@ async def get_exam_summary(
         if session:
             session.overall_compliance = overall_compliance
             session.is_summarized = True
+
+            # Lazy recompute of the mark-penalty fields. This is the
+            # "compute on demand" path agreed in the plan: completed
+            # sessions that pre-date the feature — or any session whose
+            # logs changed since the last grade — get fresh penalty
+            # numbers the first time anyone (admin or student) views the
+            # summary. The admin's final_score / score_decision are NOT
+            # touched.
+            try:
+                # Determine total marks for this exam to feed the penalty
+                # calc. If the session has no exam_id we skip silently.
+                penalty_total_marks = 0.0
+                if session.exam_id:
+                    penalty_total_marks = float(
+                        sum(
+                            float(q.marks or 0)
+                            for q in db.query(Question)
+                            .filter(Question.exam_id == session.exam_id)
+                            .all()
+                        )
+                    )
+                from services.grading_service import GradingService as _GS  # local import avoids cycle
+                _GS._recompute_proctor_decision(
+                    db=db,
+                    session=session,
+                    raw_score=float(session.score or 0.0),
+                    total_marks=penalty_total_marks,
+                )
+            except Exception as _exc:
+                logger.warning(
+                    f"Lazy penalty recompute failed for session {session.id}: {_exc}"
+                )
+
             db.commit()
 
         # Get user info
@@ -1990,11 +2496,12 @@ async def get_exam_summary(
                 detail="User not found"
             )
             
-        # Convert image to base64 if exists
+        # Convert image to base64 only when caller asked for it. Skipping it
+        # shaves the largest field off the response on slow networks.
         user_image = None
-        if user.image:
+        if include_image and user.image:
             user_image = base64.b64encode(user.image).decode('utf-8')
-        
+
         return ExamSummary(
             total_duration=round(duration, 2),
             face_detection_rate=round(face_detection_rate, 2),
@@ -2007,7 +2514,13 @@ async def get_exam_summary(
         )
         
     except Exception as e:
-        logger.error(f"Error generating summary: {str(e)}")
+        # Use logger.exception so the full traceback (file/line/type) is in
+        # the docker logs. The previous logger.error(f"...{str(e)}") rendered
+        # as a bare "Error generating summary:" with an empty message for
+        # exceptions whose __str__ is empty (e.g. AttributeError with no msg,
+        # SQLAlchemy errors that defer their message), making the failure
+        # impossible to diagnose post-mortem.
+        logger.exception("Error generating summary: %s", repr(e))
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Failed to generate summary"
@@ -2092,7 +2605,11 @@ async def submit_exam(
         if current_user.id != user_id:
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
 
-        _require_active_session_or_403(db, user_id, submission.exam_id)
+        # NOTE: ExamSubmission has no `exam_id` field — only `answers`. We
+        # validate by user only here; GradingService.grade_exam will look up
+        # the active session itself and use that session's exam_id. Passing
+        # `submission.exam_id` raised AttributeError → 500 on every submit.
+        _require_active_session_or_403(db, user_id)
 
         # Calculate Result
         result = await GradingService.grade_exam(user_id, submission, db)
@@ -2296,7 +2813,10 @@ async def get_exam_details(
     db: Session = Depends(get_db)
 ):
     """Get exam details and questions (Public/Student)"""
+    import time as _t
+    _t0 = _t.perf_counter()
     exam = db.query(Exam).filter(Exam.id == exam_id).first()
+    _t_exam = _t.perf_counter()
     if not exam:
         raise HTTPException(status_code=404, detail="Exam not found")
 
@@ -2305,7 +2825,8 @@ async def get_exam_details(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Your email is not eligible for this exam"
         )
-    
+    _t_eligible = _t.perf_counter()
+
     # Transform questions for frontend
     questions = []
     for q in exam.questions:
@@ -2317,6 +2838,12 @@ async def get_exam_details(
             "marks": q.marks,
             "image_url": q.image_url
         })
+    _t_q = _t.perf_counter()
+    logger.info(
+        f"[Timing] GET /exam/{exam_id} user={current_user.id} "
+        f"exam_q={(_t_exam-_t0)*1000:.1f}ms eligible={(_t_eligible-_t_exam)*1000:.1f}ms "
+        f"questions_load={(_t_q-_t_eligible)*1000:.1f}ms total={(_t_q-_t0)*1000:.1f}ms count={len(questions)}"
+    )
 
     return {
         "id": exam.id,

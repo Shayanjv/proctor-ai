@@ -31,6 +31,7 @@ from utils.face_reference_utils import (
     load_user_face_references,
     normalize_face_pose,
 )
+from services.seb_token_service import SebTokenService
 from utils.logger import logger
 from utils.session_manager import session_manager
 from utils.connection import manager
@@ -447,18 +448,23 @@ async def change_password(
 
 @router.get("/me/image")
 async def get_my_image(current_user: User = Depends(get_current_user)):
-    """Serve the current user's profile image"""
+    """Serve the current user's profile image.
+
+    Returns 204 No Content (not 404) when the user simply hasn't uploaded a
+    profile photo yet. This matters because the student Summary screen calls
+    this endpoint lazily on every exam completion: a 404 fills the dev
+    console with red ``Failed to load resource`` errors that look like real
+    bugs, while 204 is the correct REST signal for "request OK, nothing to
+    return". Frontend treats both as "no image, render placeholder".
+    """
     if not current_user.image:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Profile image not found"
-        )
-    
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
     # Detect image type
     image_type = imghdr.what(None, h=current_user.image)
     if not image_type:
         image_type = "jpeg" # Default fallback
-    
+
     return Response(content=current_user.image, media_type=f"image/{image_type}")
 
 @router.patch("/me/image")
@@ -779,6 +785,91 @@ async def login_password(
     )
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Safe Exam Browser auto-login flow
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# The student authenticates in their normal browser (where copy-paste works
+# and they can use a password manager for the temporary password). At the
+# moment they click "Open in SEB", the FE calls /auth/seb-token to mint a
+# short-lived single-use token, embeds it into the seb:// launch URL, and
+# the .seb config carries it onward as a query param on the FE start URL.
+#
+# When SEB starts up and the FE loads, /auth/seb-redeem swaps that token
+# for a regular access JWT — so the student never sees a login screen
+# inside the locked-down browser. See `services/seb_token_service.py` for
+# the security model (single-use jti, dedicated `purpose` claim, short
+# TTL).
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SebTokenIssueRequest(BaseModel):
+    exam_id: Optional[int] = None
+
+
+class SebTokenIssueResponse(BaseModel):
+    token: str
+    expires_in_seconds: int
+
+
+class SebTokenRedeemRequest(BaseModel):
+    token: str
+
+
+@router.post("/seb-token", response_model=SebTokenIssueResponse)
+async def issue_seb_token(
+    payload: SebTokenIssueRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Mint a short-lived single-use redeem token for the caller. Requires a
+    normal Bearer JWT — the caller must already be authenticated in their
+    regular browser. The returned token will be embedded into the .seb
+    config the FE generates next.
+    """
+    token = SebTokenService.issue(
+        user_email=current_user.email,
+        user_id=int(current_user.id),
+        exam_id=int(payload.exam_id) if payload.exam_id is not None else None,
+    )
+    return SebTokenIssueResponse(
+        token=token,
+        expires_in_seconds=int(settings.SEB_TOKEN_TTL_SECONDS or 300),
+    )
+
+
+@router.post("/seb-redeem", response_model=Token)
+async def redeem_seb_token(
+    payload: SebTokenRedeemRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Swap a single-use SEB redeem token for a regular access JWT. PUBLIC —
+    the token *is* the credential. Replays / forged / expired / wrong-
+    purpose tokens all return 401.
+
+    On success the caller (the FE running inside SEB) receives the same
+    payload shape as /login/password and stores it the same way.
+    """
+    claims = SebTokenService.redeem(payload.token, db)
+
+    user = db.query(User).filter(User.id == claims.user_id).first()
+    if user is None or user.email != claims.sub:
+        # Belt-and-braces: token claims must still match a live user.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="SEB token references an unknown user.",
+        )
+
+    access_token = create_access_token(data={"sub": user.email})
+    return Token(
+        access_token=access_token,
+        token_type="bearer",
+        id=int(user.id),
+        role=str(user.role),
+    )
+
+
 @router.post("/login/password-face", response_model=Token)
 async def login_password_face(
     request: Request,
@@ -904,8 +995,12 @@ async def login_password_face(
         )
 
     try:
-        _persist_face_bind_success(db, user, fresh_reference_payloads)
-        logger.info("Face references updated at login for user_id=%s", user.id)
+        if image_front:
+            image_data = await image_front.read()
+            if image_data:
+                user.image = image_data
+                db.commit()
+                logger.info("Face image updated at login for user_id=%s", user.id)
     except Exception as e:
         db.rollback()
         logger.error("Failed to update face references for %s: %s", normalized_email, str(e), exc_info=True)

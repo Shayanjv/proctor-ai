@@ -26,6 +26,21 @@ class ExamSession(Base):
     score: Any = Column(Float, nullable=True) # type: ignore
     overall_compliance: Any = Column(Float, nullable=True) # type: ignore
 
+    # Mark-penalty engine outputs (services/mark_penalty_service.py).
+    # Computed automatically after grading and on-demand when a summary is
+    # viewed. NULL means "not yet computed for this session".
+    major_violation_count: Any = Column(Integer, nullable=True)  # type: ignore
+    critical_violation_count: Any = Column(Integer, nullable=True)  # type: ignore
+    proctor_penalty_pct: Any = Column(Float, nullable=True)  # type: ignore
+    proctor_adjusted_score: Any = Column(Float, nullable=True)  # type: ignore
+
+    # Admin's final-score decision. NULL final_score == pending review.
+    final_score: Any = Column(Float, nullable=True)  # type: ignore
+    score_decision: Any = Column(String(16), nullable=True)  # "raw"|"penalised"|"manual" type: ignore
+    score_decision_by: Any = Column(Integer, ForeignKey("users.id"), nullable=True)  # type: ignore
+    score_decision_at: Any = Column(DateTime, nullable=True)  # type: ignore
+
     # Relationships
-    user = relationship("User", back_populates="exam_sessions")
+    user = relationship("User", foreign_keys=[user_id], back_populates="exam_sessions")
     exam = relationship("Exam", back_populates="sessions")
+    score_decided_by_user = relationship("User", foreign_keys=[score_decision_by])

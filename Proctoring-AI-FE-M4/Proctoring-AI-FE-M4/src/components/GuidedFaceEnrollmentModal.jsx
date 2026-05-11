@@ -36,7 +36,14 @@ const MANUAL_FALLBACK_DELAY_LOGIN_MS = 0; // login: show manual button IMMEDIATE
 const QUALITY_MIN_BRIGHTNESS = 42;
 const QUALITY_MAX_BRIGHTNESS = 235;
 const QUALITY_MIN_CONTRAST = 14;
-const QUALITY_MIN_SHARPNESS = 5;
+// Laplacian variance — values typical for in-focus webcam grabs sit at 60+.
+// Anything under ~12 is genuinely blurred (motion / out of focus).
+const QUALITY_MIN_LAPLACIAN_VARIANCE = 12;
+// Burst capture parameters used when enforceQuality is enabled. We sample a
+// few frames in quick succession and keep the sharpest one — this avoids
+// rejecting a perfectly valid attempt because of a single motion-blurred frame.
+const BURST_FRAME_COUNT = 6;
+const BURST_INTERVAL_MS = 90;
 
 const GUIDE_COLORS = {
   green: {
@@ -62,70 +69,116 @@ const GUIDE_COLORS = {
   },
 };
 
-const evaluateImageQuality = (context, canvas) => {
+// Compute basic luminance statistics + Laplacian variance for a frame. The
+// Laplacian variance is the standard "is this image blurry?" metric (used by
+// OpenCV's classic blur detector). It is the variance of the discrete
+// 4-neighbour Laplacian over the frame: in-focus edges produce high variance,
+// blurred frames produce near-uniform Laplacian responses ⇒ low variance.
+const measureFrame = (context, canvas) => {
   const SAMPLE_STEP = 6;
-  const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+  const { width, height } = canvas;
+  const data = context.getImageData(0, 0, width, height).data;
 
   let samples = 0;
   let sum = 0;
   let sumSq = 0;
-  let sharpnessSum = 0;
+  let lapSum = 0;
+  let lapSumSq = 0;
 
-  for (let y = 1; y < canvas.height - 1; y += SAMPLE_STEP) {
-    for (let x = 1; x < canvas.width - 1; x += SAMPLE_STEP) {
-      const idx = (y * canvas.width + x) * 4;
-      const idxLeft = (y * canvas.width + (x - 1)) * 4;
-      const idxUp = ((y - 1) * canvas.width + x) * 4;
+  for (let y = 1; y < height - 1; y += SAMPLE_STEP) {
+    for (let x = 1; x < width - 1; x += SAMPLE_STEP) {
+      const idx = (y * width + x) * 4;
+      const idxL = (y * width + (x - 1)) * 4;
+      const idxR = (y * width + (x + 1)) * 4;
+      const idxU = ((y - 1) * width + x) * 4;
+      const idxD = ((y + 1) * width + x) * 4;
 
-      const gray = (data[idx] + data[idx + 1] + data[idx + 2]) / 3;
-      const grayLeft = (data[idxLeft] + data[idxLeft + 1] + data[idxLeft + 2]) / 3;
-      const grayUp = (data[idxUp] + data[idxUp + 1] + data[idxUp + 2]) / 3;
+      const g  = (data[idx]   + data[idx + 1]   + data[idx + 2])   / 3;
+      const gL = (data[idxL]  + data[idxL + 1]  + data[idxL + 2])  / 3;
+      const gR = (data[idxR]  + data[idxR + 1]  + data[idxR + 2])  / 3;
+      const gU = (data[idxU]  + data[idxU + 1]  + data[idxU + 2])  / 3;
+      const gD = (data[idxD]  + data[idxD + 1]  + data[idxD + 2])  / 3;
 
-      sum += gray;
-      sumSq += gray * gray;
-      sharpnessSum += Math.abs(gray - grayLeft) + Math.abs(gray - grayUp);
+      const lap = (4 * g) - gL - gR - gU - gD;
+
+      sum += g;
+      sumSq += g * g;
+      lapSum += lap;
+      lapSumSq += lap * lap;
       samples += 1;
     }
   }
 
   if (samples === 0) {
-    return {
-      ok: false,
-      message: 'Unable to assess capture quality. Please retry.',
-    };
+    return { samples: 0 };
   }
 
   const mean = sum / samples;
-  const variance = Math.max(0, (sumSq / samples) - (mean * mean));
-  const contrast = Math.sqrt(variance);
-  const sharpness = sharpnessSum / samples;
+  const contrast = Math.sqrt(Math.max(0, (sumSq / samples) - (mean * mean)));
+  const lapMean = lapSum / samples;
+  const sharpness = Math.max(0, (lapSumSq / samples) - (lapMean * lapMean));
+
+  return { samples, mean, contrast, sharpness };
+};
+
+const evaluateImageQuality = (context, canvas) => {
+  const stats = measureFrame(context, canvas);
+  if (!stats.samples) {
+    return { ok: false, message: 'Unable to assess capture quality. Please retry.' };
+  }
+  const { mean, contrast, sharpness } = stats;
 
   if (mean < QUALITY_MIN_BRIGHTNESS) {
-    return {
-      ok: false,
-      message: 'Image is too dark. Move to better lighting and retry.',
-    };
+    return { ok: false, message: 'Image is too dark. Move to better lighting and retry.' };
   }
   if (mean > QUALITY_MAX_BRIGHTNESS) {
-    return {
-      ok: false,
-      message: 'Image is too bright. Reduce glare and retry.',
-    };
+    return { ok: false, message: 'Image is too bright. Reduce glare and retry.' };
   }
   if (contrast < QUALITY_MIN_CONTRAST) {
-    return {
-      ok: false,
-      message: 'Face contrast is too low. Improve lighting and retry.',
-    };
+    return { ok: false, message: 'Face contrast is too low. Improve lighting and retry.' };
   }
-  if (sharpness < QUALITY_MIN_SHARPNESS) {
-    return {
-      ok: false,
-      message: 'Image looks blurry. Hold still and retry capture.',
-    };
+  if (sharpness < QUALITY_MIN_LAPLACIAN_VARIANCE) {
+    return { ok: false, message: 'Image looks blurry. Hold still and retry capture.' };
   }
 
-  return { ok: true };
+  return { ok: true, sharpness };
+};
+
+// Apply a light, conservative unsharp mask to recover gradient on
+// soft / heavily-denoised webcam frames WITHOUT inventing structure.
+// We only sharpen where the image is genuinely soft (small kernel,
+// modest amount), so face geometry is preserved for embedding.
+const applyUnsharpMask = (imageData, width, height, amount = 0.45) => {
+  const src = imageData.data;
+  const out = new Uint8ClampedArray(src.length);
+  out.set(src);
+
+  // 3x3 Gaussian-ish blur via separable mean (cheap, good enough as the
+  // low-pass component for an unsharp mask).
+  const blur = new Uint8ClampedArray(src.length);
+  for (let y = 1; y < height - 1; y += 1) {
+    for (let x = 1; x < width - 1; x += 1) {
+      const o = (y * width + x) * 4;
+      for (let c = 0; c < 3; c += 1) {
+        const sum =
+          src[o - width * 4 - 4 + c] + src[o - width * 4 + c] + src[o - width * 4 + 4 + c] +
+          src[o - 4 + c]             + src[o + c]             + src[o + 4 + c] +
+          src[o + width * 4 - 4 + c] + src[o + width * 4 + c] + src[o + width * 4 + 4 + c];
+        blur[o + c] = sum / 9;
+      }
+      blur[o + 3] = src[o + 3];
+    }
+  }
+
+  // out = clamp(src + amount * (src - blur))
+  for (let i = 0; i < src.length; i += 4) {
+    for (let c = 0; c < 3; c += 1) {
+      const v = src[i + c] + amount * (src[i + c] - blur[i + c]);
+      out[i + c] = v < 0 ? 0 : v > 255 ? 255 : v;
+    }
+    out[i + 3] = src[i + 3];
+  }
+  return new ImageData(out, width, height);
 };
 
 const enhanceFrameForLowQualityCamera = (context, canvas) => {
@@ -149,33 +202,82 @@ const enhanceFrameForLowQualityCamera = (context, canvas) => {
     data[i + 2] = Math.max(0, Math.min(255, (((data[i + 2] - 128) * contrast) + 128) * gain + offset));
   }
 
-  context.putImageData(imageData, 0, 0);
+  // Light unsharp mask — strictly an edge-recovery pass, not a generative one.
+  const sharpened = applyUnsharpMask(imageData, canvas.width, canvas.height, 0.45);
+  context.putImageData(sharpened, 0, 0);
 };
 
-const captureFrameFromVideo = async (videoElement, options = {}) => {
-  const { enforceQuality = false, enhanceFrame = true } = options;
-  if (!videoElement || !videoElement.videoWidth || !videoElement.videoHeight) {
-    throw new Error('Camera preview is not ready yet.');
-  }
-
+// Grab a single frame from <video> into a fresh canvas. Helper used both for
+// single-shot capture and as the per-iteration step of the burst capture below.
+const grabFrameToCanvas = (videoElement) => {
   const MAX_CAPTURE_WIDTH = 960;
   const scale = Math.min(1, MAX_CAPTURE_WIDTH / videoElement.videoWidth);
   const canvas = document.createElement('canvas');
   canvas.width = Math.max(1, Math.round(videoElement.videoWidth * scale));
   canvas.height = Math.max(1, Math.round(videoElement.videoHeight * scale));
   const context = canvas.getContext('2d', { willReadFrequently: true });
-
   if (!context) {
     throw new Error('Unable to prepare image capture.');
   }
-
   context.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
+  return { canvas, context };
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const captureFrameFromVideo = async (videoElement, options = {}) => {
+  const {
+    enforceQuality = false,
+    enhanceFrame = true,
+    burstFrames = enforceQuality ? BURST_FRAME_COUNT : 1,
+    burstIntervalMs = BURST_INTERVAL_MS,
+  } = options;
+
+  if (!videoElement || !videoElement.videoWidth || !videoElement.videoHeight) {
+    throw new Error('Camera preview is not ready yet.');
+  }
+
+  // ── Burst capture: sample a few raw frames so a single motion-blurred
+  // frame doesn't fail the user. We measure each on raw pixels (pre-enhance,
+  // pre-encode) and keep only the sharpest by Laplacian variance. The
+  // enhancement / unsharp pass is applied to the winner only — much cheaper
+  // and preserves the embedding-relevant geometry.
+  let best = null;
+  let bestStats = null;
+
+  for (let i = 0; i < Math.max(1, burstFrames); i += 1) {
+    const grab = grabFrameToCanvas(videoElement);
+    const stats = measureFrame(grab.context, grab.canvas);
+    if (stats.samples) {
+      if (!bestStats || (stats.sharpness ?? 0) > (bestStats.sharpness ?? 0)) {
+        best = grab;
+        bestStats = stats;
+      }
+    } else if (!best) {
+      best = grab;
+      bestStats = stats;
+    }
+    if (i < burstFrames - 1) {
+      // Small delay so we actually sample distinct camera frames (most
+      // webcams produce a new frame every ~33-66ms at 30/60 fps).
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(burstIntervalMs);
+    }
+  }
+
+  if (!best) {
+    throw new Error('Camera preview is not ready yet.');
+  }
+
+  const { canvas, context } = best;
 
   if (enhanceFrame) {
     enhanceFrameForLowQualityCamera(context, canvas);
   }
 
   if (enforceQuality) {
+    // Re-evaluate after enhancement so the threshold reflects what we actually
+    // ship to the verifier.
     const quality = evaluateImageQuality(context, canvas);
     if (!quality.ok) {
       throw new Error(quality.message);
@@ -183,7 +285,7 @@ const captureFrameFromVideo = async (videoElement, options = {}) => {
   }
 
   const blob = await new Promise((resolve) => {
-    canvas.toBlob((value) => resolve(value), 'image/jpeg', 0.75);
+    canvas.toBlob((value) => resolve(value), 'image/jpeg', 0.85);
   });
 
   if (!blob) {
@@ -192,7 +294,8 @@ const captureFrameFromVideo = async (videoElement, options = {}) => {
 
   return {
     blob,
-    previewUrl: canvas.toDataURL('image/jpeg', 0.75),
+    previewUrl: canvas.toDataURL('image/jpeg', 0.85),
+    sharpness: bestStats?.sharpness,
   };
 };
 

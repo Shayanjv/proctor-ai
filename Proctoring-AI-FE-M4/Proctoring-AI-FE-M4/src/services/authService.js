@@ -312,6 +312,62 @@ export const authService = {
         }
     },
 
+    /**
+     * Step 1 of the SEB hand-off:
+     * Ask the backend (while we're still in the regular browser, fully
+     * authenticated) for a short-lived single-use token that we will bake
+     * into the .seb config's startURL. Throws on network / auth failure.
+     */
+    async requestSebToken(examId) {
+        const { token } = this.getAuth();
+        if (!token) throw new Error('Not signed in');
+
+        const response = await fetch(`${API_URL}/api/v1/auth/seb-token`, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+                exam_id: examId !== undefined && examId !== null && examId !== ''
+                    ? Number(examId)
+                    : null,
+            }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(parseApiDetail(data.detail) || 'Could not mint SEB token');
+        }
+        return data; // { token, expires_in_seconds }
+    },
+
+    /**
+     * Step 2 of the SEB hand-off:
+     * Inside SEB, the FE detects `?seb_token=…` in the URL and trades it
+     * for a normal access JWT here. PUBLIC endpoint — the SEB token IS
+     * the credential, single-use enforced server-side.
+     *
+     * On success, side-effect: the JWT is persisted via `setAuth()`, so
+     * the rest of the app behaves exactly as if the user had just logged
+     * in normally.
+     */
+    async redeemSebToken(sebToken) {
+        if (!sebToken) throw new Error('Missing SEB token');
+
+        const response = await fetch(`${API_URL}/api/v1/auth/seb-redeem`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ token: sebToken }),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(parseApiDetail(data.detail) || 'SEB auto-login failed');
+        }
+
+        this.setAuth(data);
+        return data;
+    },
+
     setAuth(data) {
         const token = data.token ?? data.access_token;
         const userId = data.id ?? data.userId;

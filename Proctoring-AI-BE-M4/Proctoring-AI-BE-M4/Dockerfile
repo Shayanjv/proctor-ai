@@ -62,7 +62,21 @@ EXPOSE 8000
 # Command to run the application using Gunicorn (Production)
 # We use uvicorn worker class for FastAPI.
 #
-# IMPORTANT: Multi-worker cold start + model warmup can trigger worker timeouts and cause
-# ERR_EMPTY_RESPONSE in the browser due to worker restarts. Default to 1 worker for stability.
-# You can scale via WEB_CONCURRENCY when running on a machine with enough CPU/RAM.
-CMD ["/bin/sh", "-c", "gunicorn -w ${WEB_CONCURRENCY:-1} --preload --timeout 300 --graceful-timeout 30 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:8000"]
+# IMPORTANT: the ML stack (YOLOv8 / PyTorch / MediaPipe / DeepFace) does not
+# behave well with gunicorn's --preload flag: models are initialised in the
+# master process, then every fork()-ed worker inherits half-initialised CUDA /
+# OpenCV state. Combined with --timeout 300 that was SIGKILL-ing workers in
+# the middle of long inference bursts, producing periodic 5–10 s periods
+# where HTTP requests hang while a new worker boots and re-loads ~500 MB of
+# model weights.
+#
+# The fixes:
+#   -w 1             Single worker → no fork-after-ML-init, predictable memory
+#                    footprint. Set WEB_CONCURRENCY=N to scale when you know
+#                    the host has headroom (each worker is ~2–3 GB).
+#   (no --preload)   Each worker loads models cleanly in its own process.
+#   --timeout 0      Disable the request-watchdog that was killing healthy
+#                    workers during long (but legitimate) ML inference. The
+#                    graceful-shutdown path still works on container stop.
+#   --graceful-timeout 30  Unchanged; only applies during deliberate restarts.
+CMD ["/bin/sh", "-c", "gunicorn -w ${WEB_CONCURRENCY:-1} --timeout 0 --graceful-timeout 30 -k uvicorn.workers.UvicornWorker main:app --bind 0.0.0.0:8000"]

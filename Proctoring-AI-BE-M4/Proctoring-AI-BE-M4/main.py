@@ -33,6 +33,7 @@ from models.exam_eligible_students import ExamEligibleStudent  # Ensure table cr
 from models.user_face_references import UserFaceReference  # Ensure table creation
 from models.user_password_reset_requirements import UserPasswordResetRequirement  # Ensure table creation
 from models.policy_audit import PolicyAudit  # Ensure table creation
+from models.seb_token_consumed import SebTokenConsumed  # Ensure table creation (SEB single-use redeem tokens)
 from utils.image_utils import decode_image_data
 from utils.mediapipe_config import configure_mediapipe
 from utils.time_utils import utc_iso, utc_now_iso
@@ -104,16 +105,83 @@ async def startup_event():
         # Initialize tables
         Base.metadata.create_all(bind=engine)
         logger.info("Database tables created successfully")
-        
+
+        # ─────────────────────────────────────────────────────────────
+        # Idempotent column-level migrations.
+        #
+        # Base.metadata.create_all only adds *missing tables*; it does NOT
+        # add new columns to tables that already exist in the database.
+        # When we ship new nullable columns on long-lived tables (e.g.
+        # ExamSession's mark-penalty fields) this loop ensures running
+        # databases pick them up without a separate alembic step. Each
+        # ALTER uses IF NOT EXISTS, so re-running on a fresh DB or on a
+        # DB that's already up-to-date is a no-op.
+        #
+        # Postgres-only syntax (`ADD COLUMN IF NOT EXISTS`). On SQLite the
+        # ALTERs are skipped — SQLite is dev-only and create_all + a
+        # fresh test.db covers it.
+        # ─────────────────────────────────────────────────────────────
+        try:
+            dialect = engine.dialect.name if engine.dialect else ""
+            if dialect == "postgresql":
+                exam_session_columns: list[tuple[str, str]] = [
+                    ("major_violation_count",    "INTEGER"),
+                    ("critical_violation_count", "INTEGER"),
+                    ("proctor_penalty_pct",      "DOUBLE PRECISION"),
+                    ("proctor_adjusted_score",   "DOUBLE PRECISION"),
+                    ("final_score",              "DOUBLE PRECISION"),
+                    ("score_decision",           "VARCHAR(16)"),
+                    ("score_decision_by",        "INTEGER"),
+                    ("score_decision_at",        "TIMESTAMP"),
+                ]
+                with engine.begin() as conn:
+                    for col_name, col_type in exam_session_columns:
+                        conn.execute(text(
+                            f"ALTER TABLE exam_sessions "
+                            f"ADD COLUMN IF NOT EXISTS {col_name} {col_type}"
+                        ))
+                logger.info(
+                    "Idempotent column migrations applied (mark-penalty fields)."
+                )
+        except Exception as exc:
+            # Non-fatal: a missing column will surface as an SQLAlchemy
+            # error at query time. We log and continue so a partially-up
+            # service can still serve unrelated endpoints.
+            logger.warning(
+                f"Idempotent column migration failed (continuing): {exc}"
+            )
+
         # Auto-seed admin user
         seed_admin()
 
         # Warm-start detector pipeline so first WS frame is real-time.
+        # We BLOCK readiness on warmup completion so the first /exam/start and
+        # WS frame don't pay model-init / GIL-contention costs.
         try:
+            import asyncio as _asyncio
+
             from services.warmup_service import WarmupService
 
-            # Fire-and-forget warmup in a daemon thread — does NOT block the event loop.
+            # Spawn the daemon-thread warmup (lazy ML imports + dummy inferences).
             WarmupService.start_warmup()
+
+            # Wait for completion off the event loop. Capped so a misconfigured
+            # environment cannot wedge container startup forever.
+            warmup_timeout_s = float(os.environ.get("WARMUP_TIMEOUT_S", "120"))
+            ready = await _asyncio.to_thread(
+                WarmupService.wait_until_ready, warmup_timeout_s
+            )
+            state = WarmupService.get_state()
+            if ready:
+                logger.info(
+                    f"[Startup] Detector pipeline ready in {state.get('warmup_ms')}ms"
+                )
+            else:
+                logger.warning(
+                    "[Startup] Detector warmup did not finish within "
+                    f"{warmup_timeout_s}s (state={state}). Continuing; first request "
+                    "may pay cold-start latency."
+                )
         except Exception as exc:
             logger.warning(f"Detector warmup scheduling failed: {exc}")
         
@@ -200,7 +268,12 @@ async def admin_live_websocket(
         return
 
     try:
-        current_user = await get_current_user_ws(token, db)
+        # get_current_user_ws returns (user, payload) — the student WS handler
+        # below unpacks correctly; this admin handler was treating the whole
+        # tuple as the user, which surfaced as
+        # "AttributeError: 'tuple' object has no attribute 'role'" in the
+        # logs and a WS 1008 policy-violation close on every admin connect.
+        current_user, _payload = await get_current_user_ws(token, db)
         if current_user.role != "admin":
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return

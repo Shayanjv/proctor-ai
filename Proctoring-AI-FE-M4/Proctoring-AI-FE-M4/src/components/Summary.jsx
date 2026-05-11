@@ -6,6 +6,8 @@ import jsPDF from 'jspdf';
 import { authService } from '../services/authService';
 import { examService } from '../services/examService';
 import { formatServerDateTime } from '../utils/timeUtils';
+import { quitSEB } from '../app/utils/seb';
+import NetworkSlowBanner from './NetworkSlowBanner';
 import '../styles/summary.css';
 
 const Summary = () => {
@@ -17,29 +19,28 @@ const Summary = () => {
     const [loading, setLoading] = useState(true);
     const [examViolation, setExamViolation] = useState(null);
     const [appealSubmitting, setAppealSubmitting] = useState(false);
+    // Auto-logout countdown after results render. Long enough that the
+    // student can read their score and download a PDF, short enough that
+    // an unattended exam machine doesn't keep an authenticated session
+    // alive. The user can also click "Logout now" any time.
+    const AUTO_LOGOUT_SECONDS = 90;
+    const [logoutCountdown, setLogoutCountdown] = useState(AUTO_LOGOUT_SECONDS);
+    const autoLogoutTriggeredRef = useRef(false);
     const navigate = useNavigate();
     const examId = localStorage.getItem('examId');
     const examRoute = examId ? `/exam/${examId}` : '/exam';
-    const warningItems = Array.isArray(summary?.warnings)
-        ? summary.warnings.map((warning) => (
-            typeof warning === 'string'
-                ? warning
-                : warning?.message || warning?.type || JSON.stringify(warning)
-        ))
-        : [];
+    // Sum ACTUAL occurrence counts across event types, NOT the number
+    // of distinct types. The BE shape is
+    //     suspicious_activities: { [event_type]: { count, first_occurrence } }
+    // so 5 phone_detected + 3 multiple_people events = 8 violations
+    // (NOT "2 violations"). This drives the "Violations" metric tile,
+    // the Compliance Score subtitle, and the PDF report — they all need
+    // the real count to be meaningful to students and admins.
+    const majorViolationCount = Object.values(summary?.suspicious_activities || {})
+        .reduce((acc, entry) => acc + (Number(entry?.count) || 0), 0);
 
-    const violationLabel = (warning) => {
-        if (typeof warning === 'string') return warning;
-        const rawLabel = warning?.message || warning?.type || String(warning);
-        const normalized = String(rawLabel || '').trim().toLowerCase().replace(/-/g, '_');
-        const labels = {
-            face_outside_box: 'Face Outside Guide Box',
-            face_partially_visible: 'Partial Face Visible',
-            face_too_close: 'Face Too Close To Camera',
-            face_too_far: 'Face Too Far From Camera',
-        };
-        return labels[normalized] || rawLabel;
-    };
+
+
 
     const formatTerminationReason = (type) => {
         const normalized = String(type || '').trim().toLowerCase();
@@ -79,7 +80,10 @@ const Summary = () => {
                     setExamResult(JSON.parse(examResultData));
                 }
 
-                const summaryData = await examService.getExamSummary(userId);
+                // Fetch the textual summary WITHOUT the embedded user photo so
+                // the results render quickly on slow networks. The photo is
+                // streamed lazily after the summary is shown.
+                const summaryData = await examService.getExamSummary(userId, { includeImage: false });
 
                 const violationData = localStorage.getItem('examViolation');
                 if (violationData) {
@@ -91,18 +95,25 @@ const Summary = () => {
                     total_duration: summaryData.total_duration || 0,
                     face_detection_rate: summaryData.face_detection_rate || 0,
                     suspicious_activities: summaryData.suspicious_activities || {},
-                    warnings: summaryData.warnings || [],
                     user: summaryData.user || {}
                 });
 
-                if (summaryData.user?.image) {
+                // Photo arrives separately so a slow image transfer never
+                // blocks the score / metrics from being visible.
+                examService.getMyImageDataUrl().then((dataUrl) => {
+                    if (!dataUrl) return;
+                    const base64 = typeof dataUrl === 'string' && dataUrl.includes(',')
+                        ? dataUrl.split(',', 2)[1]
+                        : null;
+                    setSummary((prev) => (
+                        prev
+                            ? { ...prev, user: { ...(prev.user || {}), image: base64 } }
+                            : prev
+                    ));
                     const img = new Image();
-                    img.src = `data:image/jpeg;base64,${summaryData.user.image}`;
-                    await new Promise((resolve) => {
-                        img.onload = resolve;
-                    });
-                    setUserImage(img);
-                }
+                    img.src = dataUrl;
+                    img.onload = () => setUserImage(img);
+                });
 
             } catch (error) {
                 console.error('Error loading summary:', error);
@@ -195,56 +206,48 @@ const renderSummaryChart = () => {
     );
 };
 
-const renderViolations = () => {
-    const violations = JSON.parse(localStorage.getItem('examViolations') || '{}');
-    if (!Object.keys(violations).length) return null;
-    const warningList = Array.isArray(violations.warnings) ? violations.warnings : [];
 
-    return (
-        <div className="section-card violations">
-            <h3>Exam Violations</h3>
-            <div className="violation-stats">
-                <div className="compliance-score">
-                    <span>Compliance Score</span>
-                    <strong>{violations.complianceScore}%</strong>
-                </div>
-                <div className="violation-list">
-                    {warningList.map((warning, index) => (
-                        <div key={index} className="violation-item">
-                            <span className="violation-icon">⚠️</span>
-                            <span>{violationLabel(warning)}</span>
-                        </div>
-                    ))}
-                </div>
-                {violations.type && (
-                    <div className="termination-reason">
-                        <span>Exam Terminated Due To:</span>
-                        <strong>
-                            {formatTerminationReason(violations.type)}
-                            {violations.attempts > 1 && ` (${violations.attempts} attempts)`}
-                        </strong>
-                    </div>
-                )}
-            </div>
-        </div>
-    );
-};
 
     const handleLogout = async () => {
+        // Guard against the auto-logout effect and a manual click both firing
+        // logout in the same tick.
+        if (autoLogoutTriggeredRef.current) return;
+        autoLogoutTriggeredRef.current = true;
         try {
             const userId = localStorage.getItem('userId');
             if (userId) {
                 await examService.clearLogs(userId);
             }
 
+            // Inside SEB → auto-quit the locked-down browser. Outside SEB →
+            // fall back to the normal navigate-to-login redirect.
             authService.logout();
-            navigate('/login', { replace: true });
+            quitSEB(() => navigate('/login', { replace: true }));
         } catch (error) {
             console.warn('Logout error:', error);
             authService.logout();
-            navigate('/login', { replace: true });
+            quitSEB(() => navigate('/login', { replace: true }));
         }
     };
+
+    // Once the summary is rendered, count down to an automatic logout. The
+    // student is intentionally NOT allowed to navigate back to the exam —
+    // a completed session cannot be retaken (backend enforces this on
+    // /exam/available too) and lingering on the results page indefinitely
+    // creates an idle authenticated session on a likely-shared machine.
+    useEffect(() => {
+        if (loading) return;
+        if (autoLogoutTriggeredRef.current) return;
+        if (logoutCountdown <= 0) {
+            handleLogout();
+            return undefined;
+        }
+        const timer = setTimeout(() => {
+            setLogoutCountdown((seconds) => seconds - 1);
+        }, 1000);
+        return () => clearTimeout(timer);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [loading, logoutCountdown]);
 
     const handleDownloadPDF = async () => {
         try {
@@ -298,13 +301,30 @@ const renderViolations = () => {
             pdf.setFontSize(12);
             pdf.setFont('helvetica', 'normal');
             pdf.text(
-                `Score: ${examResult ? examResult.score : score}/${examResult ? examResult.total_marks : '?'}`,
+                `Original Score: ${examResult ? examResult.score : score}/${examResult ? examResult.total_marks : '?'}`,
                 20,
                 yPosition
             );
-            pdf.text(`Compliance Rate: ${summary.overall_compliance.toFixed(1)}%`, 20, yPosition + lineHeight);
+            pdf.text(`Compliance Score: ${summary.overall_compliance.toFixed(1)}%`, 20, yPosition + lineHeight);
             pdf.text(`Duration: ${summary.total_duration.toFixed(1)} minutes`, 20, yPosition + lineHeight * 2);
             pdf.text(`Face Detection Rate: ${summary.face_detection_rate.toFixed(1)}%`, 20, yPosition + lineHeight * 3);
+
+            // Pending-admin-review notice (replaces the old "Final Score" line).
+            yPosition += lineHeight * 5;
+            pdf.setFont('helvetica', 'bold');
+            pdf.setTextColor(202, 138, 4);
+            pdf.text('Final Score: Pending Admin Review', 20, yPosition);
+            yPosition += lineHeight - 1;
+            pdf.setFont('helvetica', 'normal');
+            pdf.setFontSize(10);
+            pdf.setTextColor(0, 0, 0);
+            const noticeLines = pdf.splitTextToSize(
+                'Your final score will be calculated based on your compliance and violations. Please wait for the admin to review your submission.',
+                pageWidth - 40
+            );
+            pdf.text(noticeLines, 20, yPosition);
+            yPosition += lineHeight * noticeLines.length;
+            pdf.setFontSize(12);
 
             // Violations Section
             yPosition += lineHeight * 5;
@@ -329,16 +349,16 @@ const renderViolations = () => {
                 pdf.text('No major violations detected', 25, yPosition);
             }
 
-            // Add warnings if available
-            if (summary.warnings?.length > 0) {
+            // Add termination reason if present
+            if (examViolation && examViolation.type) {
                 yPosition += lineHeight * 2;
                 pdf.setFont('helvetica', 'bold');
-                pdf.text('Warnings', 20, yPosition);
+                pdf.setTextColor(239, 68, 68);
+                pdf.text('Exam Terminated Due To:', 20, yPosition);
+                yPosition += lineHeight;
                 pdf.setFont('helvetica', 'normal');
-                summary.warnings.forEach(warning => {
-                    yPosition += lineHeight;
-                    pdf.text(`- ${violationLabel(warning)}`, 25, yPosition);
-                });
+                pdf.text(formatTerminationReason(examViolation.type), 25, yPosition);
+                pdf.setTextColor(0, 0, 0);
             }
 
             // Footer
@@ -350,13 +370,42 @@ const renderViolations = () => {
             // Save the PDF
             pdf.save(`exam_summary_${localStorage.getItem('userId')}.pdf`);
 
-            await Swal.fire({
+            // After the PDF lands in the student's Downloads folder, walk
+            // them straight out of the session: a 5-second countdown Swal
+            // followed by `handleLogout()` which (a) clears local auth and
+            // (b) auto-quits Safe Exam Browser via quitSEB(). They can
+            // cancel ("Stay on this page") if they need a minute, but the
+            // default path is: download → logout. Matches the product
+            // intent that a completed/downloaded exam is *done*.
+            const AUTO_LOGOUT_AFTER_DOWNLOAD_MS = 5000;
+            const result = await Swal.fire({
                 icon: 'success',
                 title: 'Download Complete',
-                text: 'Your exam summary has been downloaded successfully.',
+                html:
+                    'Your exam summary has been downloaded.<br/>' +
+                    'Logging you out and closing Safe Exam Browser in ' +
+                    `<b>${AUTO_LOGOUT_AFTER_DOWNLOAD_MS / 1000}</b> seconds…`,
                 background: '#2a2a2a',
-                color: '#fff'
+                color: '#fff',
+                timer: AUTO_LOGOUT_AFTER_DOWNLOAD_MS,
+                timerProgressBar: true,
+                showCancelButton: true,
+                showConfirmButton: true,
+                confirmButtonText: 'Logout now',
+                cancelButtonText: 'Stay on this page',
+                allowOutsideClick: false,
+                allowEscapeKey: false,
             });
+
+            // Logout on confirm OR on timer expiry. Cancel keeps the page
+            // open (the existing AUTO_LOGOUT_SECONDS countdown still runs
+            // in the background, so the student is never stuck).
+            if (
+                result.isConfirmed ||
+                result.dismiss === Swal.DismissReason.timer
+            ) {
+                await handleLogout();
+            }
         } catch (error) {
             console.error('PDF generation error:', error);
             Swal.fire({
@@ -446,10 +495,13 @@ const renderUserInfo = () => {
 
     if (loading) {
         return (
-            <div className="summary-loading">
-                <div className="loading-spinner"></div>
-                <h3>Loading Exam Results...</h3>
-            </div>
+            <>
+                <NetworkSlowBanner />
+                <div className="summary-loading">
+                    <div className="loading-spinner"></div>
+                    <h3>Loading Exam Results...</h3>
+                </div>
+            </>
         );
     }
 
@@ -457,6 +509,7 @@ const renderUserInfo = () => {
 
     return (
         <div className="summary-container">
+            <NetworkSlowBanner />
             <div ref={summaryRef} className="summary-shell">
                 {renderUserInfo()}
                 <div className="summary-header">
@@ -466,29 +519,71 @@ const renderUserInfo = () => {
                             {examResult.status === 'passed' ? 'Passed' : 'Failed'}
                         </div>
                     )}
-                    <div className="header-stats">
+                    {/*
+                      * Two-column hero panel (mark-penalty workflow):
+                      *   LEFT  → Original Marks (raw correctness, what the student earned)
+                      *   RIGHT → Compliance Score (proctor compliance %, with major-violation count)
+                      *
+                      * The student deliberately does NOT see a final score here.
+                      * The pending-review notice below makes that explicit — the
+                      * admin will commit the final mark via the score-decision
+                      * endpoint, after which the student's transcript reflects it.
+                      */}
+                    <div
+                        className="header-stats"
+                        style={{ gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' }}
+                    >
                         <div className="stat-card primary">
-                            <h3>Score</h3>
+                            <h3>Original Marks</h3>
                             <div className="score-display">
                                 <strong>{examResult ? examResult.score : score}</strong>
-                                <span>/{examResult ? examResult.total_marks : '?'}</span>
+                                <span>/{examResult && examResult.total_marks != null ? examResult.total_marks : '—'}</span>
                             </div>
-                            <p>Marks Obtained</p>
+                            <p>{examResult
+                                ? `${examResult.percentage}% • ${examResult.correct}/${examResult.total_questions} correct`
+                                : 'Marks earned by correctness'}</p>
                         </div>
                         <div className="stat-card secondary">
-                            <h3>Percentage</h3>
+                            <h3>Compliance Score</h3>
                             <div className="score-display">
-                                <strong>{examResult ? examResult.percentage : 0}%</strong>
+                                <strong>{(summary.overall_compliance || 0).toFixed(1)}</strong>
+                                <span>%</span>
                             </div>
-                            <p>Overall Score</p>
+                            <p>
+                                {majorViolationCount > 0
+                                    ? `${majorViolationCount} major violation${majorViolationCount === 1 ? '' : 's'} detected`
+                                    : 'No major violations detected'}
+                            </p>
                         </div>
-                        <div className="stat-card tertiary">
-                            <h3>Questions</h3>
-                            <div className="score-display">
-                                <strong>{examResult ? examResult.correct : 0}</strong>
-                                <span>/{examResult ? examResult.total_questions : 0}</span>
-                            </div>
-                            <p>Correct Answers</p>
+                    </div>
+
+                    {/* Pending-admin-review notice. Replaces what used to be a
+                        "Final Score" card. Per product decision: the student
+                        is logged out shortly after this page renders and the
+                        admin commits the final mark separately. */}
+                    <div
+                        className="pending-review-notice"
+                        style={{
+                            marginTop: '1rem',
+                            padding: '1rem 1.1rem',
+                            borderRadius: '14px',
+                            background: 'linear-gradient(135deg, rgba(245, 158, 11, 0.18), rgba(217, 119, 6, 0.12))',
+                            border: '1px solid rgba(245, 158, 11, 0.35)',
+                            color: '#fde68a',
+                            display: 'flex',
+                            alignItems: 'flex-start',
+                            gap: '0.75rem',
+                            lineHeight: 1.45,
+                        }}
+                    >
+                        <span style={{ fontSize: '1.1rem', lineHeight: 1 }}>⏳</span>
+                        <div>
+                            <strong style={{ display: 'block', marginBottom: 2, color: '#fbbf24' }}>
+                                Final score pending admin review
+                            </strong>
+                            <span style={{ fontSize: '0.92rem', color: '#fde68a', opacity: 0.95 }}>
+                                Your final score will be calculated based on your compliance and violations. Please wait for the admin to review your submission.
+                            </span>
                         </div>
                     </div>
                     {examResult && (
@@ -534,8 +629,8 @@ const renderUserInfo = () => {
                                     <strong>{(summary.face_detection_rate || 0).toFixed(1)}%</strong>
                                 </div>
                                 <div className="metric-item">
-                                    <span>Warnings</span>
-                                    <strong>{warningItems.length}</strong>
+                                    <span>Violations</span>
+                                    <strong>{majorViolationCount}</strong>
                                 </div>
                                 {examViolation && examViolation.type === 'copy-paste' && (
                                     <div className="metric-item violation">
@@ -547,10 +642,10 @@ const renderUserInfo = () => {
                         </div>
                     </div>
 
-                    {summary.suspicious_activities && Object.keys(summary.suspicious_activities).length > 0 && (
-                        <div className="activity-section">
-                            <div className="section-card">
-                                <h3>Major Violations</h3>
+                    <div className="activity-section">
+                        <div className="section-card">
+                            <h3>Major Violations</h3>
+                            {summary.suspicious_activities && Object.keys(summary.suspicious_activities).length > 0 ? (
                                 <div className="activity-list">
                                     {Object.entries(summary.suspicious_activities).map(([key, value]) => {
                                         const violation = formatViolationDisplay(key, value);
@@ -573,29 +668,35 @@ const renderUserInfo = () => {
                                         );
                                     })}
                                 </div>
-                            </div>
+                            ) : (
+                                <p style={{ color: '#10b981', padding: '1rem', textAlign: 'center', fontSize: '0.95rem' }}>
+                                    ✓ No major violations detected
+                                </p>
+                            )}
+                            {examViolation && examViolation.type && (
+                                <div className="termination-reason" style={{
+                                    marginTop: '0.75rem',
+                                    padding: '0.75rem 1rem',
+                                    borderRadius: '10px',
+                                    background: 'rgba(239, 68, 68, 0.1)',
+                                    border: '1px solid rgba(239, 68, 68, 0.25)',
+                                }}>
+                                    <span style={{ color: '#fca5a5', fontSize: '0.85rem' }}>Exam Terminated Due To:</span>
+                                    <strong style={{ display: 'block', color: '#f87171', marginTop: '0.25rem' }}>
+                                        {formatTerminationReason(examViolation.type)}
+                                    </strong>
+                                </div>
+                            )}
                         </div>
-                    )}
+                    </div>
 
-                    {renderViolations()}
 
-                    {warningItems.length > 0 && (
-                        <div className="section-card warnings-section">
-                            <h3>Warnings Timeline</h3>
-                            <div className="warnings-list">
-                                {warningItems.map((warning, index) => (
-                                    <div key={`${warning}-${index}`} className="warning-item">
-                                        <span className="warning-index">{String(index + 1).padStart(2, '0')}</span>
-                                        <p>{warning}</p>
-                                    </div>
-                                ))}
-                            </div>
-                        </div>
-                    )}
 
                     <div className="actions-section">
                         <button onClick={handleLogout} className="action-button primary">
-                            Complete Exam & Logout
+                            {logoutCountdown > 0
+                                ? `Complete Exam & Logout  (auto in ${logoutCountdown}s)`
+                                : 'Complete Exam & Logout'}
                         </button>
                         <button onClick={handleDownloadPDF} className="action-button secondary">
                             Download Summary
@@ -607,9 +708,10 @@ const renderUserInfo = () => {
                         >
                             {appealSubmitting ? 'Submitting Review Request...' : 'Request Manual Review'}
                         </button>
-                        <button onClick={() => navigate(examRoute)} className="action-button secondary">
-                            Back to Exam
-                        </button>
+                        {/* 'Back to Exam' intentionally removed: a completed
+                            session cannot be retaken (backend enforces this),
+                            and offering the button confused students into
+                            thinking a second attempt was possible. */}
                     </div>
                 </div>
             </div>

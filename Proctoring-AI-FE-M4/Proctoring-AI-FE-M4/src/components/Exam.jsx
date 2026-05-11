@@ -12,6 +12,7 @@ import { handleTabVisibility, getTabSwitchCount } from '../utils/tabVisibility';
 import { getCopyPasteCount, handleCopyPaste } from '../utils/copyPasteTracker';
 import { useScreenRecorder } from '../hooks/useScreenRecorder';
 import { getLobbyProgress, hasCompletedNetworkChecks } from '../app/utils/lobbyProgress';
+import { quitSEB } from '../app/utils/seb';
 import {
   Chart as ChartJS,
   ArcElement,
@@ -19,6 +20,7 @@ import {
   Legend,
   Title
 } from 'chart.js';
+import NetworkSlowBanner from './NetworkSlowBanner';
 import './Exam.css'; // Import styles for alerts and layout
 
 ChartJS.register(
@@ -493,15 +495,20 @@ const Exam = () => {
         stopRecording();
         await examService.forceCloseExam(userId);
 
-        // Navigate — NEVER reload. Reloading breaks SPA session flow.
+        // Always clear local auth first so neither path leaves a stale
+        // JWT in storage. Then either auto-quit Safe Exam Browser (when
+        // the exam is being taken inside SEB) or fall back to the
+        // regular navigate-to-login flow when running in a normal
+        // browser. Reloading is intentionally avoided — it breaks the
+        // SPA session flow.
         authService.logout();
-        navigate('/login', { replace: true });
+        quitSEB(() => navigate('/login', { replace: true }));
       });
 
     } catch (error) {
       console.error('[Exam] Termination error:', error);
       authService.logout();
-      navigate('/login', { replace: true });
+      quitSEB(() => navigate('/login', { replace: true }));
     }
   };
 
@@ -763,6 +770,25 @@ const Exam = () => {
 
   const handleWebSocketMessage = (data) => {
     console.log("Received WebSocket message:", data);
+    if (data.type === 'session_terminated') {
+      // Backend has already enforced policy termination and is about to close
+      // the WebSocket. Without this branch the FE silently ignores the signal,
+      // the ws layer enters its reconnect loop, and every reconnect is rejected
+      // because the session is now in 'terminated' state server-side.
+      // Reuse the local termination flow so we cleanly:
+      //   - flip terminationRef so no further client-side policy code fires,
+      //   - log the termination with the backend-supplied reason/details,
+      //   - end the WS session (stops reconnect + frame capture),
+      //   - navigate the student to the summary screen.
+      const backendReason = (data.reason || 'backend-termination').toString();
+      const triggerType = backendReason.replace(/_/g, '-');
+      triggerTerminationOnce(triggerType, 1, {
+        policy: 'backend-policy',
+        backend_reason: backendReason,
+        backend_details: data.details || null,
+      });
+      return;
+    }
     if (data.type === 'keepalive') {
       setConnected(true);
     } else if (data.type === 'frame_processed') {
@@ -1487,7 +1513,14 @@ const Exam = () => {
       };
       const result = await examService.submitExam(userId, submissionData);
 
+      // Persist BOTH the bare score (legacy key, still used by some
+      // fallbacks) AND the full ExamResult payload that the Summary
+      // screen needs to render Original Marks ("X/Y"), the Pass/Fail
+      // badge, and the per-question breakdown. Previously we only
+      // saved `result.score`, so the denominator and breakdown all
+      // showed "?" / hidden when the student landed on Summary.
       localStorage.setItem('examScore', result.score);
+      localStorage.setItem('examResult', JSON.stringify(result));
 
       // Wait for summary
       const summary = await pollForSummary(userId);
@@ -1573,7 +1606,7 @@ const Exam = () => {
     throw new Error('Failed to get exam summary');
   };
 
-  const handleAnswer = async (answer) => {
+  const handleAnswer = (answer) => {
     const currentQuestionId = questions[currentQuestion]?.id;
     if (!currentQuestionId) {
       return;
@@ -1581,88 +1614,88 @@ const Exam = () => {
 
     const newUserAnswers = upsertAnswerEntry(userAnswers, currentQuestionId, answer);
     setUserAnswers(newUserAnswers);
-    setShortAnswer(''); // Clear short answer field for next question
 
     if (answer === questions[currentQuestion].correct_option) {
       setScore(score + 1);
     }
 
     const nextQuestion = currentQuestion + 1;
-    const nextQuestionIndex = nextQuestion < questions.length ? nextQuestion : currentQuestion;
-    await persistExamProgress({
+    const advancing = nextQuestion < questions.length;
+    const nextQuestionIndex = advancing ? nextQuestion : currentQuestion;
+
+    // Persist progress in the background — DO NOT await. Awaiting blocked
+    // the question advance behind a network round-trip, which inside Safe
+    // Exam Browser (slower WebView, no parallel-tab warmup) produced a
+    // 1–3s "dead click" where the student saw no response after picking
+    // an option and assumed the button was broken. Fire-and-forget keeps
+    // the UI snappy; transient saveProgress failures are non-fatal (the
+    // final submit is the source of truth).
+    persistExamProgress({
       answers: newUserAnswers,
       currentQuestionIndex: nextQuestionIndex,
       remainingSeconds: timeRemaining,
+    }).catch((error) => {
+      console.debug('persistExamProgress (background) failed:', error);
     });
 
-    if (nextQuestion < questions.length) {
+    if (advancing) {
+      // Clear the short-answer textarea ONLY when moving to a new question.
+      // On the last question we keep the value visible so the student can
+      // review/edit it before clicking the explicit Submit Exam button.
+      setShortAnswer('');
       setCurrentQuestion(nextQuestion);
-    } else {
-      if (videoRef.current?.srcObject) {
-        videoRef.current.srcObject.getTracks().forEach(track => {
-          track.stop();
-        });
-        videoRef.current.srcObject = null;
-      }
-
-      Swal.fire({
-        title: 'Processing Results',
-        html: 'Please wait while we analyze your exam session...',
-        allowOutsideClick: false,
-        allowEscapeKey: false,
-        showConfirmButton: false,
-        didOpen: () => {
-          Swal.showLoading();
-        },
-        background: '#2a2a2a',
-        color: '#fff'
-      });
-
-      try {
-        if (wsHandlerRef.current) {
-          await wsHandlerRef.current.endSession();
-        }
-
-        // Stop screen recording immediately
-        stopRecording();
-
-        const userId = localStorage.getItem('userId');
-
-        // Submit answers to backend
-        const submissionData = {
-          answers: newUserAnswers
-        };
-        const result = await examService.submitExam(userId, submissionData);
-
-        // Store full result for Summary page
-        localStorage.setItem('examScore', result.score);
-        localStorage.setItem('examResult', JSON.stringify(result));
-
-        const summary = await pollForSummary(userId);
-        localStorage.setItem('examSummary', JSON.stringify(summary));
-
-        await Swal.close();
-        navigate('/summary');
-      } catch (error) {
-        console.error('Error during exam completion:', error);
-        Swal.update({
-          title: 'Processing Results',
-          html: 'Please wait while we complete the analysis...',
-          showConfirmButton: false
-        });
-        setTimeout(async () => {
-          try {
-            const userId = localStorage.getItem('userId');
-            const summary = await pollForSummary(userId, 1);
-            localStorage.setItem('examSummary', JSON.stringify(summary));
-          } catch (finalError) {
-            console.error('Final attempt failed:', finalError);
-          }
-          await Swal.close();
-          navigate('/summary');
-        }, 5000);
-      }
     }
+    // Last question: stay put, retain UI state, and let the student review.
+    // Final submission now requires an explicit click on "Submit Exam" so we
+    // never auto-grade behind their back — see promptSubmitExamWithConfirmation.
+  };
+
+  // Counts entries with a non-empty selected_option — short-answer responses
+  // and MCQ selections both store text in selected_option, while skipped
+  // questions store null/"".
+  const countAnswered = (answersList) => (
+    (answersList || []).reduce((acc, entry) => {
+      const value = entry?.selected_option;
+      if (value === null || value === undefined) return acc;
+      return String(value).trim().length > 0 ? acc + 1 : acc;
+    }, 0)
+  );
+
+  const promptSubmitExamWithConfirmation = () => {
+    const totalQuestions = questions.length;
+    if (totalQuestions === 0) return;
+
+    const answeredCount = countAnswered(userAnswers);
+    const unansweredCount = Math.max(0, totalQuestions - answeredCount);
+
+    Swal.fire({
+      title: 'Submit your exam?',
+      html: `
+        <div style="text-align:left;line-height:1.55">
+          <p style="margin:0 0 10px">You have answered <strong>${answeredCount}</strong> of <strong>${totalQuestions}</strong> questions.</p>
+          ${unansweredCount > 0
+            ? `<p style="color:#fbbf24;margin:0 0 10px"><strong>${unansweredCount} question${unansweredCount === 1 ? '' : 's'} unanswered</strong> — they will be marked as skipped (0 marks).</p>`
+            : '<p style="color:#34d399;margin:0 0 10px">All questions answered.</p>'}
+          <p style="margin:0 0 6px"><strong>Please double-check every answer before confirming.</strong></p>
+          <p style="margin:0;color:#fca5a5">Once submitted, you cannot edit your answers or retake this exam.</p>
+        </div>
+      `,
+      icon: 'warning',
+      showCancelButton: true,
+      confirmButtonText: 'Yes, submit my exam',
+      cancelButtonText: 'Review my answers',
+      confirmButtonColor: '#10b981',
+      cancelButtonColor: '#6b7280',
+      background: '#2a2a2a',
+      color: '#fff',
+      reverseButtons: true,
+      focusCancel: unansweredCount > 0,
+    }).then((result) => {
+      if (result.isConfirmed) {
+        // Reuse the existing finish path, explicitly NOT a violation.
+        handleFinishExam(false);
+      }
+    });
   };
 
   const handleFinishExam = async (isViolation = false) => {
@@ -1717,14 +1750,20 @@ const Exam = () => {
       };
       const result = await examService.submitExam(userId, submissionData);
 
+      // Persist BOTH the bare score AND the full ExamResult so the
+      // Summary screen can render "X/Y", Pass/Fail, and the per-question
+      // breakdown. See sibling comment in handleTimeoutSubmit.
       localStorage.setItem('examScore', result.score);
+      localStorage.setItem('examResult', JSON.stringify(result));
       localStorage.setItem('tabSwitches', getTabSwitchCount());
 
       const summary = await pollForSummary(userId);
       localStorage.setItem('examSummary', JSON.stringify(summary));
 
       await Swal.close();
-      navigate('/summary');
+      // replace:true so the browser back-button cannot return to the exam
+      // page after submission — the session is finalized server-side too.
+      navigate('/summary', { replace: true });
     } catch (error) {
       console.error('Error during exam completion:', error);
       Swal.update({
@@ -1741,7 +1780,7 @@ const Exam = () => {
           console.error('Final attempt failed:', finalError);
         }
         await Swal.close();
-        navigate('/summary');
+        navigate('/summary', { replace: true });
       }, 5000);
     }
   };
@@ -1976,6 +2015,7 @@ const Exam = () => {
 
   return (
     <div className="exam-wrapper">
+    <NetworkSlowBanner />
     <div className="dashboard-layout">
       {typeof document !== 'undefined' ? createPortal(alertsMarkup, document.body) : alertsMarkup}
       <aside
@@ -2195,10 +2235,10 @@ const Exam = () => {
                     Time Remaining: {formatTime(timeRemaining)}
                   </div>
                   <button
-                    onClick={handleFinishExam}
+                    onClick={() => promptSubmitExamWithConfirmation()}
                     className="finish-exam-btn"
                   >
-                    Finish Exam
+                    Submit Exam
                   </button>
                 </div>
 
@@ -2224,21 +2264,36 @@ const Exam = () => {
                           className="submit-short-answer-btn"
                           disabled={!shortAnswer?.trim()}
                         >
-                          Next Question
+                          {currentQuestion + 1 < questions.length ? 'Next Question' : 'Save Answer'}
                         </button>
                       </div>
                     </div>
                   ) : (
                     <div className="options-grid">
-                      {(questions[currentQuestion].options || []).map((option, index) => (
-                        <button
-                          key={`${option}-${index}`}
-                          onClick={() => handleAnswer(option)}
-                          className="option-button"
-                        >
-                          {option}
-                        </button>
-                      ))}
+                      {(() => {
+                        // Look up the currently-recorded answer for this
+                        // question so we can highlight it in the UI. Without
+                        // this, clicking an option gives zero visual feedback
+                        // on the final question (where the page doesn't
+                        // auto-advance) — students think their click failed.
+                        const currentQId = questions[currentQuestion]?.id;
+                        const selectedForThisQuestion = currentQId !== undefined && currentQId !== null
+                          ? buildAnswerMap(userAnswers)[String(currentQId)]
+                          : undefined;
+                        return (questions[currentQuestion].options || []).map((option, index) => {
+                          const isSelected = option === selectedForThisQuestion;
+                          return (
+                            <button
+                              key={`${option}-${index}`}
+                              onClick={() => handleAnswer(option)}
+                              className={`option-button${isSelected ? ' option-button--selected' : ''}`}
+                              aria-pressed={isSelected}
+                            >
+                              {option}
+                            </button>
+                          );
+                        });
+                      })()}
                     </div>
                   )}
 

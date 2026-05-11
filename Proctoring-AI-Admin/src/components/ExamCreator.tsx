@@ -53,6 +53,16 @@ interface BannerState {
   message: string;
 }
 
+interface PublishedExam {
+  exam_id: number | null;
+  title: string;
+  exam_url: string;
+  temporary_password: string | null;
+  monitor_key: string | null;
+  eligible_email_count: number;
+  published_at: string;
+}
+
 const DEFAULT_CONFIG: CreatorConfig = {
   duration_minutes: { min: 15, max: 240, step: 15, default: 60 },
   default_question_marks: 1,
@@ -173,6 +183,7 @@ export function ExamCreator() {
   const [publishedTempPassword, setPublishedTempPassword] = useState<string | null>(null);
   const [publishedMonitorKey, setPublishedMonitorKey] = useState<string | null>(null);
   const [publishedEligibleEmailCount, setPublishedEligibleEmailCount] = useState(0);
+  const [publishedExams, setPublishedExams] = useState<PublishedExam[]>([]);
   const [eligibleEmails, setEligibleEmails] = useState<string[]>([]);
   const [rosterFileName, setRosterFileName] = useState<string | null>(null);
   const [isImportingRoster, setIsImportingRoster] = useState(false);
@@ -501,16 +512,33 @@ export function ExamCreator() {
       };
 
       const response = await api.post('exam/admin/exam', payload);
-      setPublishedLink(response.data?.exam_url || null);
-      setPublishedExamId(Number(response.data?.exam_id) || null);
-      setPublishedTempPassword(response.data?.temporary_password || null);
-      setPublishedMonitorKey(response.data?.monitor_key || null);
-      setPublishedEligibleEmailCount(Number(response.data?.eligible_email_count) || 0);
+      const examUrl = String(response.data?.exam_url || '');
+      const examId = Number(response.data?.exam_id) || null;
+      const tempPassword = response.data?.temporary_password || null;
+      const monitorKey = response.data?.monitor_key || null;
+      const eligibleCount = Number(response.data?.eligible_email_count) || 0;
+      setPublishedLink(examUrl || null);
+      setPublishedExamId(examId);
+      setPublishedTempPassword(tempPassword);
+      setPublishedMonitorKey(monitorKey);
+      setPublishedEligibleEmailCount(eligibleCount);
+      setPublishedExams((curr) => [
+        {
+          exam_id: examId,
+          title: title.trim(),
+          exam_url: examUrl,
+          temporary_password: tempPassword,
+          monitor_key: monitorKey,
+          eligible_email_count: eligibleCount,
+          published_at: new Date().toISOString(),
+        },
+        ...curr,
+      ]);
       setBanner({
         tone: 'success',
         message: eligibleEmails.length > 0
-          ? 'Exam published and eligible student accounts were prepared for first-time password reset.'
-          : 'Exam published successfully.',
+          ? 'Exam published and eligible accounts prepared. Click “Create another exam” to publish the next one.'
+          : 'Exam published successfully. Click “Create another exam” to publish the next one.',
       });
 
     } catch (error: unknown) {
@@ -518,6 +546,30 @@ export function ExamCreator() {
       setBanner({ tone: 'error', message: detail || 'Failed to publish exam.' });
     } finally {
       setIsPublishing(false);
+    }
+  };
+
+  const resetForNewExam = () => {
+    setTitle('');
+    setDescription(config.default_description ?? '');
+    setDuration(config.duration_minutes.default);
+    scheduleTouchedRef.current = false;
+    const nextStart = addMinutes(nowLocal(), config.default_access_buffer_minutes);
+    setStartTime(nextStart);
+    setEndTime(addMinutes(nextStart, config.duration_minutes.default));
+    setSingleUse(false);
+    setQuestions([]);
+    setEligibleEmails([]);
+    setRosterFileName(null);
+    setActiveTab('manual');
+    setPublishedLink(null);
+    setPublishedExamId(null);
+    setPublishedTempPassword(null);
+    setPublishedMonitorKey(null);
+    setPublishedEligibleEmailCount(0);
+    setBanner({ tone: 'info', message: 'Form cleared. Configure the next exam.' });
+    if (typeof window !== 'undefined') {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
     }
   };
 
@@ -993,6 +1045,118 @@ export function ExamCreator() {
                 </div>
               </div>
             )}
+            <div className="mt-6 flex flex-col items-stretch gap-3 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                onClick={resetForNewExam}
+                className="inline-flex items-center justify-center gap-2 rounded-lg border border-cyan-600 bg-white px-6 py-2.5 text-sm font-semibold text-cyan-700 transition hover:bg-cyan-50"
+              >
+                <Plus className="h-4 w-4" />
+                Create another exam
+              </button>
+            </div>
+          </motion.div>
+        )}
+
+        {publishedExams.length > 0 && (
+          <motion.div
+            initial={{ opacity: 0, y: 10 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="mt-8 rounded-xl border border-slate-200 bg-white p-6 shadow-lg"
+          >
+            <div className="mb-4 flex items-center justify-between gap-3">
+              <div>
+                <h3 className="text-lg font-semibold text-slate-900">Published exams (this session)</h3>
+                <p className="mt-1 text-xs text-slate-500">
+                  Every exam you published in this browser session. The list clears on page refresh.
+                </p>
+              </div>
+              <span className="shrink-0 rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold text-slate-700">
+                {publishedExams.length} total
+              </span>
+            </div>
+            <div className="space-y-3">
+              {publishedExams.map((exam, index) => (
+                <div
+                  key={`${exam.exam_id ?? 'exam'}-${index}-${exam.published_at}`}
+                  className="rounded-lg border border-slate-200 bg-slate-50 p-4"
+                >
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="min-w-0">
+                      <p className="truncate text-sm font-semibold text-slate-900">
+                        {exam.title || 'Untitled exam'}
+                      </p>
+                      <p className="text-xs text-slate-500">
+                        {exam.exam_id ? `ID ${exam.exam_id} \u2022 ` : ''}
+                        Published {new Date(exam.published_at).toLocaleString()}
+                        {exam.eligible_email_count > 0 ? ` \u2022 ${exam.eligible_email_count} eligible students` : ''}
+                      </p>
+                    </div>
+                  </div>
+                  <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        readOnly
+                        value={exam.exam_url}
+                        className="flex-1 rounded-lg border border-slate-300 bg-white px-3 py-1.5 text-xs text-slate-700"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => void copyValue(exam.exam_url, 'Exam link copied to clipboard.')}
+                        className="rounded-lg bg-cyan-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-cyan-700"
+                      >
+                        <span className="inline-flex items-center gap-1.5">
+                          <Copy className="h-3.5 w-3.5" />
+                          Link
+                        </span>
+                      </button>
+                    </div>
+                    {exam.temporary_password && (
+                      <div className="flex items-center gap-2">
+                        <input
+                          type="text"
+                          readOnly
+                          value={exam.temporary_password}
+                          className="flex-1 rounded-lg border border-amber-300 bg-white px-3 py-1.5 text-xs font-semibold text-slate-900"
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void copyValue(exam.temporary_password, 'Temporary password copied to clipboard.')}
+                          className="rounded-lg bg-amber-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-amber-700"
+                        >
+                          <span className="inline-flex items-center gap-1.5">
+                            <Copy className="h-3.5 w-3.5" />
+                            Password
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                    {exam.monitor_key && (
+                      <div className="flex items-center gap-2 sm:col-span-2">
+                        <input
+                          type="text"
+                          readOnly
+                          value={exam.monitor_key}
+                          className="flex-1 rounded-lg border border-violet-300 bg-white px-3 py-1.5 text-xs font-black tracking-[0.2em] text-violet-900"
+                          style={{ fontFamily: 'ui-monospace, monospace' }}
+                        />
+                        <button
+                          type="button"
+                          onClick={() => void copyValue(exam.monitor_key, 'Monitor key copied to clipboard.')}
+                          className="rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-medium text-white hover:bg-violet-700"
+                        >
+                          <span className="inline-flex items-center gap-1.5">
+                            <Copy className="h-3.5 w-3.5" />
+                            Monitor key
+                          </span>
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
           </motion.div>
         )}
 

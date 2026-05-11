@@ -54,36 +54,55 @@ A real-time AI proctoring system that monitors exam sessions using computer visi
 
 ### Using Docker (Recommended)
 
-1. Build and run using Docker Compose:
+#### First-time setup
+
+Fill in `.env` (POSTGRES_*, MINIO_*, CORS_ORIGINS, SEED_*) then bring up the
+full stack:
+
 ```bash
-docker-compose up --build
+docker compose up --build -d
 ```
 
-### Docker Troubleshooting
+This starts the web service on **localhost:8080** plus Postgres, MinIO, and
+Redis. Persistent data is stored in named Docker volumes so you can stop and
+start without losing anything.
 
-If you encounter the error "Cannot connect to the Docker daemon":
+#### Day-2 operations on a long-lived deployment
 
-1. Make sure Docker Desktop is installed and running
-2. On macOS:
+For an existing container named `proctoring-backend` (the default image
+target), use the helper scripts in `scripts/` to apply changes without
+disturbing the data volumes:
+
+| When you change …                            | Run                                  | Approx. downtime |
+| -------------------------------------------- | ------------------------------------ | ---------------- |
+| Any `*.py` file                              | `./scripts/reload-backend.ps1`       | ~5–8 s (gunicorn SIGHUP) |
+| `Dockerfile`, `requirements.txt`, or env     | `./scripts/redeploy-backend.ps1`     | ~30–60 s (rebuild + recreate) |
+
+Both scripts default to `proctoring-backend`; pass `-ContainerName <name>` to
+target a different container (e.g. the compose-managed `proctoring-ai-web-1`).
+The redeploy script preserves env vars, network, mounts, and **never** touches
+volumes — your DB and evidence are safe across rebuilds.
+
+> **Why hot-reload works:** the Dockerfile launches gunicorn **without
+> `--preload`**, so each worker imports the app independently. SIGHUP from
+> `reload-backend.ps1` re-forks workers and they pick up the latest code from
+> the bind-mounted `/app`. If you ever add `--preload` back to the gunicorn
+> CMD, you must use `redeploy-backend.ps1` for every code change.
+
+#### Troubleshooting the Docker daemon
+
+If you see "Cannot connect to the Docker daemon":
+
+1. Ensure Docker Desktop is installed and running.
+2. On macOS, start it from the terminal:
    ```bash
-   # Start Docker Desktop from terminal
    open -a Docker
-   
-   # Wait for Docker to start (about 30 seconds)
-   # Then try running docker-compose again
-   docker-compose up --build
+   # wait ~30 s for Docker to come up, then retry the compose command
    ```
-
-3. Verify Docker is running:
+3. Verify the daemon is reachable:
    ```bash
    docker info
    ```
-
-2. Or run with Docker directly:
-```bash
-docker build -t proctoring-ai .
-docker run -p 8000:8000 proctoring-ai
-```
 
 ### Manual Setup
 
