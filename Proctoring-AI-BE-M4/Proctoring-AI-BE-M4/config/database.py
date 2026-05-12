@@ -42,6 +42,8 @@ def create_db_engine():
             db_url,
             pool_pre_ping=True,
             pool_recycle=3600,
+            pool_size=20,
+            max_overflow=40,
             connect_args=connect_args
         )
         return engine
