@@ -1428,7 +1428,16 @@ async def log_violation(
         try:
             from services.termination_policy_service import TerminationPolicyService
 
-            policy_action = TerminationPolicyService.evaluate(user.id, [str(log_data.event_type or "")])
+            # Per-exam leniency: when the exam's `config.lenient_mode` is on,
+            # environmental detections (multiple_people, prohibited_object,
+            # phone_detected) are persisted as logs above but excluded from
+            # warn/terminate accumulation here.
+            lenient_mode = TerminationPolicyService.resolve_lenient_mode(db, user.id)
+            policy_action = TerminationPolicyService.evaluate(
+                user.id,
+                [str(log_data.event_type or "")],
+                lenient_mode=lenient_mode,
+            )
             if policy_action.action in {"warn", "terminate"}:
                 await TerminationPolicyService.apply_action(db, user.id, policy_action)
                 if policy_action.action == "terminate" and manager.is_connected(user.id):

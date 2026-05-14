@@ -10,6 +10,7 @@ import {
   Mail,
   Plus,
   Send,
+  ShieldCheck,
   Trash2,
   Upload,
 } from 'lucide-react';
@@ -176,6 +177,12 @@ export function ExamCreator() {
   const [startTime, setStartTime] = useState(initialStart);
   const [endTime, setEndTime] = useState(initialEnd);
   const [singleUse, setSingleUse] = useState(false);
+  // Lenient mode: when on, the per-exam config tells the backend policy
+  // engine to skip strike accumulation / termination for environmental
+  // detections (multiple_people, prohibited_object, phone_detected) that
+  // commonly produce false positives in college-hall settings. The events
+  // themselves are still recorded so the admin can review them.
+  const [lenientMode, setLenientMode] = useState(false);
   const [currentTime, setCurrentTime] = useState(nowLocal());
   const [questions, setQuestions] = useState<Question[]>([]);
   const [publishedLink, setPublishedLink] = useState<string | null>(null);
@@ -480,6 +487,7 @@ export function ExamCreator() {
         eligible_emails: eligibleEmails.length > 0 ? eligibleEmails : undefined,
         config: {
           single_use: singleUse,
+          lenient_mode: lenientMode,
         },
         questions: questions.map((question) => {
           const marks = Number(question.points.toFixed(2));
@@ -558,6 +566,7 @@ export function ExamCreator() {
     setStartTime(nextStart);
     setEndTime(addMinutes(nextStart, config.duration_minutes.default));
     setSingleUse(false);
+    setLenientMode(false);
     setQuestions([]);
     setEligibleEmails([]);
     setRosterFileName(null);
@@ -670,6 +679,27 @@ export function ExamCreator() {
                     <Lock className="h-4 w-4 text-cyan-600" />
                     Single-use links
                   </label>
+                </div>
+
+                <div className="rounded-xl border border-amber-200 bg-amber-50 p-3">
+                  <div className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      id="lenientMode"
+                      checked={lenientMode}
+                      onChange={(event) => setLenientMode(event.target.checked)}
+                      className="mt-0.5 h-4 w-4 rounded border-amber-300 text-amber-600 focus:ring-amber-500"
+                    />
+                    <label htmlFor="lenientMode" className="flex flex-col gap-1 text-sm text-slate-900">
+                      <span className="flex items-center gap-2 font-medium">
+                        <ShieldCheck className="h-4 w-4 text-amber-600" />
+                        Lenient mode (offline / college-hall exam)
+                      </span>
+                      <span className="text-xs text-slate-600">
+                        Treat <strong>multiple people</strong>, <strong>laptop / book / keyboard</strong> and <strong>phone</strong> detections as warnings only. They will still appear in the admin timeline, but they will <em>not</em> terminate the exam or count toward strikes. Use this when students are taking the test in a shared room where other people and devices are naturally visible.
+                      </span>
+                    </label>
+                  </div>
                 </div>
 
                 <div className={`rounded-xl border-2 transition-all duration-200 ${

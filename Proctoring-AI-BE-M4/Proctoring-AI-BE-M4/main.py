@@ -484,7 +484,16 @@ async def websocket_endpoint(
                                 from services.termination_policy_service import TerminationPolicyService
 
                                 event_types = [str(item.event_type or "") for item in stored_logs]
-                                policy_action = TerminationPolicyService.evaluate(user_id, event_types)
+                                # Per-exam leniency: if exam.config.lenient_mode is on,
+                                # the policy service will skip multiple_people /
+                                # prohibited_object / phone_detected for strike counting.
+                                # The events are still stored above (admin timeline keeps them).
+                                lenient_mode = TerminationPolicyService.resolve_lenient_mode(db, user_id)
+                                policy_action = TerminationPolicyService.evaluate(
+                                    user_id,
+                                    event_types,
+                                    lenient_mode=lenient_mode,
+                                )
                                 if policy_action.action in {"warn", "terminate"}:
                                     evidence_url = None
                                     try:

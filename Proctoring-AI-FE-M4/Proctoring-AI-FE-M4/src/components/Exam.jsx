@@ -137,6 +137,18 @@ const CONFIRMED_CRITICAL_EVENT_TYPES = new Set([
   'camera_blocked_or_disabled',
 ]);
 
+// Mirror of LENIENT_MODE_DEMOTED_EVENTS in backend
+// services/termination_policy_service.py. When the per-exam config
+// `lenient_mode` flag is on, these events are kept in the admin timeline
+// (the backend still logs them) but the student frontend skips the loud
+// side alert + critical/risk registration to avoid false-positive
+// termination in shared-room exam settings.
+const LENIENT_MODE_DEMOTED_EVENTS = new Set([
+  'multiple_people',
+  'phone_detected',
+  'prohibited_object',
+]);
+
 const WARNING_ONLY_EVENT_TYPES = new Set([
   'eye_movement',
   'gaze_looking_away',
@@ -293,6 +305,10 @@ const Exam = () => {
   const [, setIsVideoReady] = useState(false);
   const frameIntervalRef = useRef(null);
   const terminationRef = useRef(false);
+  // Refreshed from examMetadata.config.lenient_mode whenever exam details load.
+  // We mirror this into a ref because the WS log handler may close over an
+  // older render and we need it to always read the current value.
+  const lenientModeRef = useRef(false);
   const tabSwitchTimesRef = useRef([]);
   const copyPasteTimesRef = useRef([]);
   const faceAbsenceStartedAtRef = useRef(null);
@@ -834,6 +850,14 @@ const Exam = () => {
           resetFaceAbsenceTracking();
         }
 
+        // Lenient mode: environmental detections are warnings-only for the
+        // admin. Do not raise the student-facing side alert and do not feed
+        // them into the local critical/risk pipeline. The backend has
+        // already persisted the log so the admin timeline still shows them.
+        if (lenientModeRef.current && LENIENT_MODE_DEMOTED_EVENTS.has(eventTypeStr)) {
+          continue;
+        }
+
         if (eventStr.includes('phone') || eventTypeStr === 'phone_detected') {
           showSideAlert('object', 'Prohibited object (Phone) detected', alertOptions);
         }
@@ -1084,6 +1108,9 @@ const Exam = () => {
         if (!isComponentMounted) return;
 
         setExamMetadata(examData);
+        // Sync lenient-mode ref as soon as exam details arrive so subsequent
+        // WS log events use the correct policy without waiting for a re-render.
+        lenientModeRef.current = !!(examData && examData.config && examData.config.lenient_mode);
         setQuestions(examData.questions || []);
         setTimeRemaining((examData.duration_minutes || 60) * 60);
         setIsVideoReady(true);

@@ -7,12 +7,27 @@ from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
 
 from config.settings import settings
+from models.exams import Exam
 from models.logs import Log
 from models.policy_audit import PolicyAudit
 from models.sessions import ExamSession
 from utils.logger import logger
 from utils.strike_store import get_state, set_state
 from utils.metrics import POLICY_ACTIONS_TOTAL
+
+
+# Events that an exam-creator can opt to demote to "warnings only" via the
+# per-exam `lenient_mode` config flag. These are the detections most prone to
+# false positives in a college-hall setting (other students visible behind the
+# camera, laptops on neighbouring desks, etc.). When lenient_mode is on we
+# still LOG them (admin can see them in the timeline and decide manually) but
+# we do NOT count them toward critical/major strike accumulation or
+# termination.
+LENIENT_MODE_DEMOTED_EVENTS: Set[str] = {
+    "multiple_people",
+    "phone_detected",
+    "prohibited_object",
+}
 
 
 @dataclass(frozen=True)
@@ -142,10 +157,61 @@ class TerminationPolicyService:
         return minor, major
 
     @classmethod
-    def evaluate(cls, user_id: int, event_types: List[str]) -> PolicyAction:
+    def resolve_lenient_mode(cls, db: Optional[Session], user_id: int) -> bool:
+        """
+        Look up the active exam session for `user_id` and return the value of
+        `exam.config.lenient_mode` (bool). Returns False on any error so the
+        default behaviour (strict proctoring) is preserved.
+
+        We intentionally tolerate a missing `db` because some callers may not
+        have one in scope; in that case we just default to False.
+        """
+        if db is None:
+            return False
+        try:
+            session_row = db.query(ExamSession).filter(
+                ExamSession.user_id == int(user_id),
+                ExamSession.status == "active",
+            ).order_by(ExamSession.start_time.desc()).first()
+            if session_row is None or session_row.exam_id is None:
+                return False
+            exam_row = db.query(Exam).filter(Exam.id == int(session_row.exam_id)).first()
+            if exam_row is None:
+                return False
+            cfg = exam_row.config if isinstance(exam_row.config, dict) else {}
+            return bool(cfg.get("lenient_mode", False))
+        except Exception as exc:
+            logger.debug("resolve_lenient_mode failed for user %s: %s", user_id, exc)
+            return False
+
+    @classmethod
+    def evaluate(
+        cls,
+        user_id: int,
+        event_types: List[str],
+        *,
+        lenient_mode: bool = False,
+    ) -> PolicyAction:
         uid = int(user_id)
         now = cls._now()
         cooldown = cls._cooldown_sec()
+
+        # Lenient mode: strip events the exam-creator chose to demote BEFORE
+        # any strike accumulation or threshold check happens. The event row
+        # is still persisted by the caller (so the admin sees it in the
+        # timeline), but it cannot drive a warn/terminate action here.
+        if lenient_mode and event_types:
+            filtered = [e for e in event_types if e not in LENIENT_MODE_DEMOTED_EVENTS]
+            if not filtered:
+                # All events in this batch were demoted - nothing to evaluate.
+                return PolicyAction(
+                    action="none",
+                    reason="lenient_mode_filtered",
+                    details={"demoted_events": sorted({
+                        e for e in event_types if e in LENIENT_MODE_DEMOTED_EVENTS
+                    })},
+                )
+            event_types = filtered
 
         state = get_state(uid) or {}
         major_strikes = int(state.get("major_strikes", 0) or 0)
