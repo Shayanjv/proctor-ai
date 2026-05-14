@@ -1818,7 +1818,22 @@ async def get_session_attempt_summary(
                 "marks_obtained": q.marks if is_correct else 0
             })
 
-        violations = _get_session_violation_logs_query(db, session).order_by(Log.timestamp.desc()).limit(50).all()
+        # Count total violations (no cap) for the accurate count displayed to admin.
+        # Use the session time-window query first; if it returns 0 (e.g. session
+        # end_time was not saved), fall back to ALL violation logs for the user so
+        # the admin always sees the same numbers as the student's own summary page.
+        total_violation_count = _get_session_violation_logs_query(db, session).count()
+        if total_violation_count == 0:
+            # Fallback: query all violation logs for this user (same as student summary)
+            violation_logs_query = db.query(Log).filter(
+                Log.user_id == session.user_id,
+                Log.event_type.notin_(list(NON_VIOLATION_EVENT_TYPES)),
+            )
+            total_violation_count = violation_logs_query.count()
+            violations = violation_logs_query.order_by(Log.timestamp.desc()).limit(50).all()
+        else:
+            violations = _get_session_violation_logs_query(db, session).order_by(Log.timestamp.desc()).limit(50).all()
+
         violation_details = [{
             "type": v.event_type,
             "timestamp": utc_iso(v.timestamp),
@@ -1860,7 +1875,7 @@ async def get_session_attempt_summary(
             "session": _build_session_summary_dict(session, total_marks=total_marks, db=db),
             "questions": question_details,
             "violations": violation_details,
-            "violation_count": len(violations)
+            "violation_count": total_violation_count
         }
     except HTTPException:
         raise
