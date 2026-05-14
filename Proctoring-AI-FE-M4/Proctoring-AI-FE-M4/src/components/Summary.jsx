@@ -305,9 +305,7 @@ const renderSummaryChart = () => {
                 20,
                 yPosition
             );
-            pdf.text(`Compliance Score: ${summary.overall_compliance.toFixed(1)}%`, 20, yPosition + lineHeight);
-            pdf.text(`Duration: ${summary.total_duration.toFixed(1)} minutes`, 20, yPosition + lineHeight * 2);
-            pdf.text(`Face Detection Rate: ${summary.face_detection_rate.toFixed(1)}%`, 20, yPosition + lineHeight * 3);
+            pdf.text(`Duration: ${summary.total_duration.toFixed(1)} minutes`, 20, yPosition + lineHeight);
 
             // Pending-admin-review notice (replaces the old "Final Score" line).
             yPosition += lineHeight * 5;
@@ -531,7 +529,7 @@ const renderUserInfo = () => {
                       */}
                     <div
                         className="header-stats"
-                        style={{ gridTemplateColumns: 'repeat(2, minmax(0, 1fr))' }}
+                        style={{ gridTemplateColumns: '1fr' }}
                     >
                         <div className="stat-card primary">
                             <h3>Original Marks</h3>
@@ -542,18 +540,6 @@ const renderUserInfo = () => {
                             <p>{examResult
                                 ? `${examResult.percentage}% • ${examResult.correct}/${examResult.total_questions} correct`
                                 : 'Marks earned by correctness'}</p>
-                        </div>
-                        <div className="stat-card secondary">
-                            <h3>Compliance Score</h3>
-                            <div className="score-display">
-                                <strong>{(summary.overall_compliance || 0).toFixed(1)}</strong>
-                                <span>%</span>
-                            </div>
-                            <p>
-                                {majorViolationCount > 0
-                                    ? `${majorViolationCount} major violation${majorViolationCount === 1 ? '' : 's'} detected`
-                                    : 'No major violations detected'}
-                            </p>
                         </div>
                     </div>
 
@@ -609,12 +595,7 @@ const renderUserInfo = () => {
                 </div>
 
                 <div className="summary-grid">
-                    <div className="chart-section">
-                        <div className="section-card">
-                            <h3>Proctoring Analysis</h3>
-                            {renderSummaryChart()}
-                        </div>
-                    </div>
+
 
                     <div className="metrics-section">
                         <div className="section-card">
@@ -624,10 +605,7 @@ const renderUserInfo = () => {
                                     <span>Duration</span>
                                     <strong>{(summary.total_duration || 0).toFixed(1)} min</strong>
                                 </div>
-                                <div className="metric-item">
-                                    <span>Face Detection</span>
-                                    <strong>{(summary.face_detection_rate || 0).toFixed(1)}%</strong>
-                                </div>
+
                                 <div className="metric-item">
                                     <span>Violations</span>
                                     <strong>{majorViolationCount}</strong>
